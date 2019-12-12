@@ -1,2 +1,1 @@
-# BayesianLearning
-Bayesian learning project - 10/2019
+# Bayesian learning project - 10/2019
