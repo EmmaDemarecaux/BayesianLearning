@@ -1,0 +1,1992 @@
+---
+title: 'MINI-PROJECT : GAUSSIAN MIXTURES'
+author : 'Emma Demarecaux'
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+# install.packages("MASS")
+# install.packages("abind")
+# install.packages("mnormt")
+# install.packages("LaplacesDemon")
+# install.packages("coda")
+# install.packages('latex2exp')
+library(MASS)
+library(abind)
+library(mnormt)
+library(LaplacesDemon)
+library(coda)
+library(latex2exp)
+```
+The aim of this mini-project is to implement and compare the Variational Bayes and Metropolis-Hastings methods. We consider the Gaussian mixture example : given a dataset, the goal is to estimate the mixture distribution. For the sake of simplicity, we consider in this project a synthetic dataset that we generate ourselves. This allows us to assess the correctness of our work, by comparison with the ground truth.
+
+# <font color='color'>  Preliminaries </font> 
+## <font color='green'> Question 1 </font> 
+In this first section, we generate a bi-variate dataset $X_{1:N}$ assumed to be $i.i.d.$ according to the density 
+$$
+f(x|\rho_{1:k}, \mu_{1:k}, \Sigma_{1:k}) = \sum_{j=1}^k \rho_j\mathcal{N}(x|\mu_j,\Sigma_j)
+$$ 
+where 
+$$
+\left\{
+    \begin{array}{ll}
+         N = 500 \\
+         k = 3\\
+        \rho_{1:3} = \begin{bmatrix}
+                     \frac{4}{10} & \frac{3}{10} & \frac{3}{10}
+                     \end{bmatrix}\\
+        \mu_{1:3} = \begin{bmatrix}
+                    0 & 0 \\
+                    1 & 0 \\
+                    0 & 1
+                    \end{bmatrix}\\
+        \nu = 4\\
+        S = \begin{bmatrix}
+                    0.02 & 0 \\
+                    0 & 0.02
+                    \end{bmatrix}\\
+        \forall i \in \{1,...,k\}\ \ \Sigma_i \sim \mathcal{W}(\nu,S)\\
+    \end{array}
+\right.
+$$
+The model can be rewritten using hidden variables $\xi_{1:N}$ with $\xi_i \in \{1,...k\}$ :
+$$
+\begin{aligned}
+  \xi_i &\sim \textrm{Multinomial}(\rho)\\
+  \mathcal{L}&(X_i|\xi_i=j) = \mathcal{N}(\mu_j,\Sigma_j)\ \ j\in \{1,...,k\}
+\end{aligned}
+$$
+It is mathematically convenient to represent the multimodal variable $\xi_i$  by a binary vector $z_i$ of size $k$. The parameter for this Gaussian mixture is thus $\theta = (\rho_{1:k}, \mu_{1:k}, \Sigma_{1:k})$, which we shall represent in $\texttt{R}$ as three objects : $\texttt{p}$, $\texttt{Mu}$, $\texttt{Sigma}$, with $\texttt{p}$ a vector of size $k$ (standing for $\rho$), $\texttt{Mu}$ a $k$ × $d$ matrix and $\texttt{Sigma}$ a $d$ × $d$ × $k$ array.
+
+
+```{r}
+set.seed(1)
+# --- Parameters
+N <- 500 # size
+k_true <- 3 # number of mixture components
+d <- 2 # space dimension
+p <- c(4/10,3/10,3/10) # Rho (k) vector
+# Mu (k × d) matrix
+Mu <- matrix(data=c(0,0,1,0,0,1), nrow=k_true, ncol=d, byrow=TRUE, dimnames=NULL) 
+nu <- 4 # Wishart parameter nu
+S <- 0.02 * diag(1,2) # Wishart parameter S
+# Sigma (d × d × k) array
+Sigma <- array(c(rwishart(nu,S), rwishart(nu, S), rwishart(nu, S)), dim=c(d,d,k_true)) 
+# representation of the multimodal variable xi by a binary vector z of size k
+z <- rmultinom(N, size=1, prob=p) 
+xi <- sapply(1:N, function(i){which(z[,i]==1)})
+# --- Generation of the dataset
+X <- matrix(rep(0, d*N), ncol=d, nrow=N) # initialization
+for (i in 1:N){
+    m <- which(z[,i]==1)
+    X[i,] <- mvrnorm(1, Mu[m,], Sigma[,,m])
+}
+```
+## <font color='green'> Question 2 </font> 
+
+Let's plot the generated data using one color for each mixture component :
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+plot(X[,1], X[,2], main='Bi-variate dataset generated from a Gaussian mixture with 3 components', 
+     xlab=TeX('$X_1$'), ylab=TeX('$X_2$'), col=xi, pch=21)
+legend("topright", legend=c('True component 1', 'True component 2', 'True component 3'), 
+       pch=21, col=1:3, ncol=3, cex=1)
+```
+Now, we can add on the same plot, the center of each Gaussian mixture component along with an ellipsoid around the mean of each Gaussian distribution which corresponds to the density level set of the univariate $0.95$ quantile.
+```{r}
+draw_sd <- function(mu , sigma)
+    #' draws  an ellipsoid  around the mean of a Gaussian distribution
+    #' which corresponds to the density level set of the univariate
+    #' 0.95 quantile.
+    #' mu: vector of size d the dimension
+    #' sigma: a d*d covariance matrix.
+    #' returns: a 2*100 matrix containing abscissas and ordinates of
+    #' the ellipsoid to be drawn. 
+{
+    L <-  chol(sigma)
+    angles <- seq(0, 2*pi, length.out=100)
+    U <- 1.64* rbind(cos(angles), sin(angles))
+    X <- mu + t(L) %*% U
+    return(X)
+}
+```
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+plot(X[,1], X[,2], main='Bi-variate dataset generated from a Gaussian mixture with 3 components', 
+     xlab=TeX('$X_1$'), ylab=TeX('$X_2$'), col=xi, pch=21)
+for(j in 1:k_true){
+    points(Mu[j,1], Mu[j,2], col=4, pch=18, cex= 10*p[j])
+    ellips <- draw_sd(mu=Mu[j,], sigma=Sigma[,,j])
+    lines(ellips[1,], ellips[2,], col=4)
+}  
+legend("topright", legend=c('True component 1', 'True component 2', 'True component 3', 'True centroids', TeX('$0.95$ quantiles')), 
+       pch=c(21,21,21,18,NA), col=c(1,2,3,4,4), lty=c(NA,NA,NA,NA,1), ncol=2, cex=1)
+```
+
+# <font color='color'>  Variational Bayes </font> 
+
+To estimate the mixture distribution from the dataset, we start with the Variational Bayes approach.
+We use a mean field variational distribution : 
+$q(z,\rho_{1:k},\mu_{1:k},\Lambda_{1:k}) = q(z)q(\rho_{1:k},\mu_{1:k},\Lambda_{1:k})$.
+It is the only assumption that we need to make in order to obtain a tractable practical solution to our Bayesian mixture model, which will be dertermined by optimization of the variational distribution.
+
+We choose a prior as follows:
+
+* $\rho_{1:k} \sim \textrm{Dir}(\alpha)$ where $\alpha$ has size $k$ and $\alpha=(\alpha_0,...,\alpha_0)^T$ with $\alpha_0 > 0$;
+
+* $\forall j \in \{1,...,k\},\ \ (\mu_{j},\Lambda_{j}) \sim \mathcal{N} (\mu_j|m_0,(\beta_0\Lambda_j)^{-1})\mathcal{W}(\Lambda_j|W_0,\nu_0)\ \ \textrm{where}\ \Lambda_{j} = (\Sigma_{j})^{-1}$;
+
+* $\rho_{1:k}$ and the pairs $(\mu_j,\Lambda_j)$ are independent.
+
+##### Let us consider the derivation of the update equation for the factor $q(z)$
+From the Bishop (2006), we know that the logarithm of the optimal factor is given by :
+$$
+\begin{aligned}
+\ln q^{\ast}(z) = \sum_{n=1}^N\sum_{j=1}^k z_{nj}\ln \gamma_{nj} + \textrm{const}
+\end{aligned}
+$$
+where :
+$$
+\begin{aligned}
+&\ln \gamma_{nj} = \mathbb{E}[\ln \rho_{j}] + \frac{1}{2}\mathbb{E}[\ln |\Lambda_{j}|] - \frac{d}{2}\ln (2\pi) -\frac{1}{2} \mathbb{E}_{\mu_{j},\Lambda_{j}}[(x_n-\mu_j)^T\Lambda_j(x_n-\mu_j)]\\
+&d = 2 \ \ (X \textrm{ is a bi-variate dataset})
+\end{aligned}
+$$
+
+We obtain :
+$$
+q^{\ast}(z) \propto \prod_{n=1}^N\prod_{j=1}^k r_{nj}^{z_{nj}}
+$$
+where the quantities $r_{nj} = \frac{\gamma_{nj}}{\sum_{j=1}^k \gamma_{nj}}$ are playing the role of responsibilities.
+
+At this point, it is convenient to define three statistics of the observed dataset evaluated with respect to the responsibilities :
+
+$\forall j \in \{1,...,k\},$
+$$
+\begin{aligned}
+N_j &= \sum_{n=1}^Nr_{nj}\\
+\bar{x}_j &= \frac{1}{N_j}\sum_{n=1}^Nr_{nj}x_n\\
+S_j &= \frac{1}{N_j}\sum_{n=1}^Nr_{nj}(x_n-\bar{x}_j)(x_n-\bar{x}_j)^T\\
+\end{aligned}
+$$
+
+##### Let us consider the derivation of the update equation for the factor $q(\rho_{1:k},\mu_{1:k},\Lambda_{1:k})$
+
+From the Bishop (2006), we have :
+$$
+\begin{aligned}
+q(\rho_{1:k},\mu_{1:k},\Lambda_{1:k}) = q(\rho_{1:k}) \prod_{j=1}^k q(\mu_{j},\Lambda_{j}) 
+\end{aligned}
+$$
+and :
+$$
+\ln q^{\ast}(\rho_{1:k})  = (\alpha_0 - 1) \sum_{j=1}^k \ln \rho_j + \sum_{j=1}^k \sum_{n=1}^N r_{nj}\ln \rho_j+ \textrm{const}
+$$
+We recognize $q^{\ast}(\rho_{1:k})$ as a Dirichlet distribution : 
+$$
+\begin{aligned}
+&q^{\ast}(\rho_{1:k}) = \textrm{Dir}(\rho_{1:k}| \alpha_{1:k})\\
+&\alpha_j = \alpha_0 + N_j\ \ \ \forall j \in \{1,...,k\}
+\end{aligned}
+$$
+Finally, the variational posterior distribution $q^{*}(\mu_{1:k},\Lambda_{1:k}) = q^{*} (\mu_{1:k} | \Lambda_{1:k}) q^{*}(\Lambda_{1:k})$ is a Gaussian-Wishart distribution and is given by :
+$$
+q^{\ast}(\mu_{j},\Lambda_{j}) = \mathcal{N} (\mu_j|m_j,(\beta_j\Lambda_j)^{-1})\mathcal{W}(\Lambda_j|W_j,\nu_j)
+$$
+where 
+$$
+\begin{aligned}
+\beta_j &= \beta_0 + N_j\\
+m_j &= \frac{1}{\beta_j}(\beta_0m_0+N_j\bar{x}_j)\\
+W_j^{-1} &= W_0^{-1} + N_jS_j + \frac{\beta_0N_j}{\beta_0+N_j}(\bar{x}_j-m_0)(\bar{x}_j-m_0)^T \\
+\nu_j &= \nu_0 + N_j
+\end{aligned}
+$$
+In order to performn this variational M-step, we need the expectations $\mathbb{E}[z_{nj}] = r_{nj}$ representing the responsibilities. This involves the following results :
+$$
+\begin{aligned}
+\mathbb{E}_{\mu_j,\Lambda_j}[(x_n-\mu_j)^T\Lambda_j(x_n-\mu_j)]
+&= \frac{d}{\beta_j}+ \nu_j(x_n-m_j)^TW_j(x_n-m_j)\\
+\ln \tilde{\Lambda}_j \equiv \mathbb{E}[\ln |\Lambda_j|] &= \sum_{i=1}^d\psi \bigg(\frac{\nu_j+1-i}{2}\bigg) + d\ln 2 + \ln |W_j|\\
+\ln \tilde{\rho}_j \equiv \mathbb{E}[\ln \rho_j] &= \psi (\alpha_j) - \psi (\hat{\alpha}) \ \ \textrm{where}\ \ \hat{\alpha} = \sum_{j=1}^k \alpha_j
+\end{aligned}
+$$
+Finally, we obtain the following result for the responsibilities :
+$$
+\begin{aligned}
+r_{nj}
+&\propto \rho_j|\Lambda_j|^{1/2} \exp \bigg\{- \frac{1}{2}(x_n-\mu_j)^T\Lambda_j(x_n-\mu_j) \bigg\}  \\
+\end{aligned}
+$$
+
+## <font color='green'> Question 1 </font> 
+
+As a stopping criterion, we use the squared $L_2$ norm between two successive values of the parameters. While this criterion is greater than some tolerance threshold (e.g. $10^{-6}$) and the number of iterations is lower than $200$, we repeat the following steps :
+
+* $\textbf{E-step}$ : given the dataset $X_{1:N}$ and the current values of $\alpha_{1:k}$, $\beta_{1:k}$, $\nu_{1:k}$, $m_{1:k}$ and $W^{-1}_{1:k}$, computing the responsibilities $r_{nj}$.
+
+* $\textbf{M-step}$ : given the current responsibilities $r_{nj}$ and the dataset $X_{1:N}$, computing $\alpha_{1:k}$, $\beta_{1:k}$, $\nu_{1:k}$, $m_{1:k}$ and $W^{-1}_{1:k}$.
+
+* $\textbf{Stopping criterion}$ : computing the criterion of the current parameters $\alpha_{1:k}$, $\beta_{1:k}$, $\nu_{1:k}$, $m_{1:k}$ and $W^{-1}_{1:k}$.
+
+To choose the starting values automatically, we use the function $\texttt{initPar}$, which runs a simple k-means. Therefore, the initial values of the $k$ mixture components are already close to the true Gaussian mixture parameters.
+
+We complete the functions $\texttt{vbMstep}$, $\texttt{vbEstep}$ and $\texttt{vbalgo}$.
+
+```{r}
+nanDetector <- function(X)
+    #' returns TRUE if X contains NaNs
+{
+   # examine data frames
+   if(is.data.frame(X)){ 
+       return(any(unlist(sapply(X, is.nan))))
+   }
+   #  examine vectors, matrices, or arrays
+   if(is.numeric(X)){
+       return(any(is.nan(X)))
+   }
+   #  examine lists, including nested lists
+   if(is.list(X)){
+       return(any(rapply(X, is.nan)))
+   }
+   return(FALSE)
+}
+
+initPar <- function(x , k){
+    #' Initialisation for VB based on kmeans. 
+    #'x: dataset: a n*d matrix for n points with d features each.
+    #'k: number of components for the inferred mixture
+    #' returns: a list with entries p, Mu, Sigma: respectively a vector of
+    #'size k (weights), a k*d matrix (centers) and a d*d*k array 
+    #' (empirical covariance matrix)
+    init <- kmeans(x = x, centers = k, iter.max = 100, nstart = 1,
+                   algorithm = c("Hartigan-Wong"), trace=FALSE)
+    Mu <- init$centers
+    d <- ncol(x)
+    Sigma <- array(dim=c(d,d,k))
+    p <- rep(0,k)
+    for( i in (1:k)){
+        inds = which(init$cluster==i)
+        n = length(inds)
+        tildeX = t(t(x[inds,]) -Mu[i,])  
+        sig = 1/n * t(tildeX) %*% tildeX
+        Sigma[,,i] <- sig
+        p[i] <-  n/nrow(x)
+    }
+    return(list(p = p, Mu = Mu, Sigma = Sigma ))
+}
+
+vbMstep <- function(x , respons , alpha0 ,  W0inv , nu0 , m0 , beta0)
+    #' x: the data. A n*d matrix 
+    #' respons: current q(z): a n*k matrix (responsibilities r_{nk})
+    #' alpha0>0: a real.  isotropic dirichlet prior parameter on p
+    #' W0inv, nu0: parameters for the Wishart prior on Lambda.
+    #' W0inv: d*d matrix, inverse of the Wishart parameter.
+    #' nu0 > d-1:  is a real.
+    #' m0 : mean parameter (d vector) for the Gaussian-Wishart prior on  mu
+    #' beta0: scale parameter for the Gaussian-wishart  prior on mu (>0)
+    #' returns: a list made of ( Alpha , Winv, Nu , M , Beta):  optimal
+    #' parameters for
+    #' q(p),
+    #' q(mu_j, Lambda_j), j=1, ...,k: 
+    #' Alpha: k-vector ; Winv: d*d*k array ; Nu: a k-vector ; M: k*d matrix ;
+    #' Beta: k-vector                   
+{
+    K <-  ncol(respons)
+    NK <- apply(respons, 2, sum) # a vector of size k
+    NK <- sapply(NK, function(x){max(x, 1e-300)}) ## avoids divisions by zero
+    ## complete the code (optimal Alpha): vector of size k (10.58)
+    Alpha <- NK + alpha0
+    ## complete the code (optimal nu): vector of size k (10.63)
+    Nu <- NK + nu0
+    ## complete the code (optimal Beta): vector of size k (10.60)
+    Beta <- NK + beta0 
+    ## k*d matrices (10.52)
+    NKx_bar <- t(respons) %*% x
+    x_bar <- NKx_bar / NK
+    ## complete the code: optimal mean parameters m_j for the mu_j's: (10.61)
+    ## a k*d matrix
+    M <- (beta0*m0 + NKx_bar) / Beta
+    d <- ncol(x)
+    N <- nrow(x)
+    Winv <- array(dim=c(d,d,K))
+    for(j in (1:K)){
+      x_bar_j <-  x_bar[j,]
+      # k*d matrix (10.53)
+      NKSK_j <- matrix(rep(0,d*d), nrow=d, ncol=d)
+      for (n in (1:N)){
+        NKSK_j <- NKSK_j + respons[n,j]  * (x[n,] - x_bar_j) %*% 
+          t(x[n,] - x_bar_j)
+      }
+      ## complete the code: optimal W^{-1}
+      ##(inverse of the covariance parameter for Lambda_j)
+      ## a d*d matrix
+      Winv[,,j] <- W0inv + NKSK_j + (beta0*NK[j]) * (x_bar_j-m0) %*%
+        t(x_bar_j-m0) / (beta0+NK[j])
+    }
+    return(list(Alpha = Alpha, Winv = Winv, Nu = Nu, M = M, Beta = Beta)) 
+}
+
+vbEstep <- function(x, Alpha, Winv, Nu, M, Beta)
+    #' computation of the variational responsibilities. 
+    #' x: the data. A n*d matrix
+    #' Alpha: a k vector: current dirichlet parameter for q(p)
+    #' Winv : a d*d*k array: current inverses of the W parameter for the
+    #' Wishart q(Lambda)
+    #' Nu: a k vector: current degrees of freedom parameter for the Wishart
+    #' q(Lambda)
+    #' M: a k*d matrix: current mean parameters for the Gaussian 
+    #' q(Mu | Lambda)
+    #' Beta: a k vector: current scale parameters for the Gaussian 
+    #' q(Mu | Lambda)
+    #' returns: a n*k matrix: the responsibilities for each data point.  
+{
+    d <-  ncol(M)
+    k <- length(Alpha)
+    N <- nrow(x)
+    Eloglambda <-  # k vector
+        sapply(1:k, function(j){
+            sum(digamma( (Nu[j] + 1 - (1:d) )/2) )+ d * log(2) - log(det(Winv[,,j]))
+        })
+    Elogrho <- # k vector
+        digamma(Alpha) - digamma(sum(Alpha))    
+    Equadratic <- # k*N  matrix
+         d / Beta  + Nu * t( sapply(1:k, function(j){ ## a N * k matrix
+            Wj <- solve(Winv[,,j])
+            sapply(1:N, function(n){# a N vector
+                t(M[j,] -x[n, ]) %*% Wj %*% (M[j,] -x[n, ])})
+        }))
+    ## Complete the code: the transpose of
+    ## the unnormalized log-responsibility matrix, ie. a k * N matrix
+    logResponsT <- matrix(rep(Elogrho + Eloglambda/2 - d*log(2*pi)/2, N),
+                          nrow=k, ncol=N) - Equadratic/2
+    logRespons <- t(logResponsT) ## N * k
+    logRespons <- logRespons - apply(logRespons, 1, max) 
+    respons <- exp(logRespons) ##  N * k matrix
+    Z <-  apply(respons, 1 , sum ) # N vector
+    respons <-  respons / Z ##N * k matrix
+    return(respons)
+}
+
+vbalgo <- function(x, k, alpha0,  W0inv, nu0, m0, beta0, tol=1e-5)
+    #' x: the data. n*d matrix
+    #' k: the number of mixture components. 
+    #' alpha0, W0inv, nu0, m0, beta0: prior hyper-parameters, see vbMstep.
+    #' returns: a list composed of (Alphamat,  Winvarray, Numat, Marray,
+    #' Betamat, responsarray, stopCriteria):
+    #'   optimal parameters for q(p), q(mu_j, Lambda_j), j=1, ...,k, 
+    #' and trace of the stopping criteria along the iteration. 
+    #'   Alphamat: K* Tmatrix,  Winvarray: d*d*T array,  Numat: a k*T
+    #' matrix-vector, 
+    #'   Marray: k*d*T array,  Betamat: k*T matrix, 
+    #' responsarray: n*k*T matrix, 
+    #'   where T is the number of steps.
+    #' stoppingCriteria: a T-vector:the stopping criterion  
+    #'at each iteration (the first entry is set to the arbitrary 0 value)
+{
+    N <- nrow(x)
+    init <-  initPar(x=x,k=k)
+    res <- list(Alphamat=matrix(nrow=k, ncol=0),
+                Winvarray = array(dim=c(d,d,k,0)),
+                Numat = matrix(nrow=k, ncol=0),
+                Marray= array(dim=c(k,d,0) ),
+                Betamat = matrix(nrow=k, ncol=0),
+                responsarray = array(dim=c(N,k, 0)),
+                stopCriteria = c(0)
+                )
+    d <- ncol(x)
+    Winvstart <- array(dim=c(d,d,k))
+    for(j in 1:k){
+        Winvstart[,,j] <- init$p[j] * N *  init$Sigma[,,j]
+        }
+    current <- list(Alpha = N * init$p, 
+                    Winv = Winvstart, 
+                    Nu = N* init$p, 
+                    M = init$Mu,
+                    Beta = N * init$p)
+    continue <- TRUE
+    niter <- 0
+    while(continue){        
+        niter <- niter+1
+        ## Complete the code
+        respons <- vbEstep(x, current$Alpha, current$Winv, current$Nu,
+                           current$M, current$Beta)
+        if(nanDetector(respons)) {stop("NaNs detected!\n")}
+        ## Complete the code
+        vbOpt <- vbMstep(x , respons , alpha0 ,  W0inv , nu0 , m0 , beta0)
+        if(nanDetector(vbOpt)) {stop("NaNs detected!\n")}
+        current <- vbOpt
+        if(niter >=2){
+          # Complete the code for computing the stopping
+          ## criterion at current iteration. 
+          s_Alpha <- sum((res$Alphamat[,niter-1] - current$Alpha) **2)
+          s_Winv <- sum((res$Winvarray[,,,niter-1] - current$Winv) **2)
+          s_Nu <- sum((res$Numat[,niter-1] - current$Nu) **2)
+          s_M <- sum((res$Marray[,,niter-1] - current$M) **2)
+          s_Beta <- sum((res$Betamat[,niter-1] - current$Beta) **2)
+          delta <- s_Alpha + s_Winv + s_Nu + s_M + s_Beta
+          res$stopCriteria <- c(res$stopCriteria,delta)
+        }
+        res$Alphamat <- cbind(res$Alphamat, current$Alpha)
+        res$Winvarray <- abind(res$Winvarray, current$Winv,along=4)
+        res$Numat <- cbind(res$Numat, current$Nu)
+        res$Marray <- abind(res$Marray, current$M,along=3)
+        res$Betamat <- cbind(res$Betamat, current$Beta)
+        res$responsarray <- abind(res$responsarray, respons,along=3)
+        if(niter>=2){
+          if( niter == 200  ||  delta < tol)          
+          {continue <- FALSE}
+        }
+      }
+    return(res)
+  }
+```
+
+## <font color='green'> Question 2 </font> 
+
+To run this algorithm, we decide to set $\texttt{Kfit} = 5$. Let's show the hyper-parameters of the model :
+```{r, echo=TRUE}
+alpha0 <- 0.1
+m0 <- rep(0,d)
+beta0 <- 0.1
+W0 <- 1*diag(d)
+nu0 <- 10
+Kfit <- 5
+```
+
+```{r, fig.width = 10, fig.height = 5 , fig.align='center'}
+#' Run VB 
+seed <- 10
+set.seed(seed)
+tol <- 1e-6
+outputvb <- vbalgo(x=X, k=Kfit, alpha0=alpha0, W0inv=solve(W0), nu0=nu0, m0=m0, beta0=beta0, tol=tol)
+T <- ncol(outputvb$Alphamat)
+#' plot the Stopping criteria over iterations
+plot(outputvb$stopCriteria, main='Stop Criteria over iterations', xlab='Iteration', 
+     ylab='Stop Criteria', col='magenta', pch=20)
+lines(1:T, rep(tol,T), col='red')
+legend("topright", legend=c('Criterion','Tolerance threshold'), lty=c(NA,1),
+           pch=c(20,NA), col=c('magenta','red'), ncol=1, cex=0.8)
+```
+From this last figure, the model seems to understand that we only have $3$ true mixture components instead of $5$, as there are $2$ peaks in the criterion values over iterations. Let's show a summary of Variational Bayes's output :
+```{r, echo=TRUE}
+T
+outputvb$Alphamat[,T]
+outputvb$Marray[,,T]
+```
+
+## <font color='green'> Question 3 </font> 
+
+To assess the quality of the ouput, we first compare the ground truth (true mixture density), with the density of the mixture associated with point estimates constructed from the Variational Bayes output. Namely, we choose as a parameter estimate, the posterior expectancy of this parameter in the variational approximation.
+
+Refering to Bishop (2006), we have : 
+
+$\forall j \in \{1,...,k\}$
+
+$$
+\begin{aligned}
+         \hat{\rho}& = \mathbb{E}\big[\rho|\alpha_{\textrm{VB},1}, ...,\alpha_{\textrm{VB},k}\big] \ \textrm{with}\ \rho \sim \textrm{Dir}(\alpha_{\textrm{VB},1}, ...,\alpha_{\textrm{VB},k})  \\
+         \hat{\mu}_j &= \mathbb{E}\big[\mu_j|m_{\textrm{VB},j},\beta_{\textrm{VB},j},\Lambda_{\textrm{VB},j}\big] \ \textrm{with}\ \mu_j \sim \mathcal{N}(m_{\textrm{VB},j},(\beta_{\textrm{VB},j}\Lambda_{\textrm{VB},j})^{-1}) \\
+         \hat{\Lambda}_j &= \mathbb{E}\big[\Lambda_j|W_{\textrm{VB},j},\nu_{\textrm{VB},j}\big] \ \textrm{with}\ \Lambda_j \sim \mathcal{W}((W\textrm{inv}_{\textrm{VB},j})^{-1},\nu_{\textrm{VB},j}) \\
+\end{aligned}
+$$
+
+$\forall j \in \{1,...,k\}$
+
+$$
+\begin{aligned}
+         \hat{\rho}_j &= \frac{\alpha_{\textrm{VB},j}}{\sum_{i=1}^k \alpha_{\textrm{VB},i} } \\
+         \hat{\mu}_j &= m_{\textrm{VB},j} \\
+         \hat{\Lambda}_j &= \nu_{\textrm{VB},j}(W\textrm{inv}_{\textrm{VB},j})^{-1}\\
+         \hat{\Sigma}_j &= \frac{W\textrm{inv}_{\textrm{VB},j}}{ \nu_{\textrm{VB},j}}
+\end{aligned}
+$$
+
+Therefore, we complete the code as follows :
+```{r, echo=TRUE}
+p_vb <- outputvb$Alphamat[,T] / sum(outputvb$Alphamat[,T])
+Mu_vb <- outputvb$Marray[,,T]
+Sigma_vb <- array(dim=c(d,d,Kfit))
+for(j in 1:Kfit){
+    Sigma_vb[,,j] <- outputvb$Winvarray[,,j,T] / outputvb$Numat[j,T]
+}
+```
+Let's show a summary of our point estimates :
+```{r, echo=TRUE}
+p_vb
+Mu_vb
+Sigma_vb
+```
+
+As a confirmation of the last figure, we can see that $2$ of the estimated mixture components have negligible weights (as well as negligible variances). Therefore, the model managed to understand the underlying structure of the data, and converged pretty quickly to the true Gaussian mixture parameters due to the accurate k-means initialization. We decide to remove the estimated mixture components with negligible weights ($\rho_i< 0.001$). Let's display the number of estimated components after removing negligible ones :
+```{r}
+if (length(which(p_vb<0.001)) > 0){
+    Sigma_vb <- Sigma_vb[,,-which(p_vb<0.001)]
+    Mu_vb <- Mu_vb[-which(p_vb<0.001),]
+    p_vb <- p_vb[-which(p_vb<0.001)]
+}
+k_vb = length(p_vb)
+```
+
+```{r,echo=TRUE}
+k_vb 
+```
+
+Now that we have our Variational Bayes mixture estimate, we can assign each data point to one of the estimated Gaussian components. For each data point, we will keep a colored cycle, representing the true Gaussian components, and we will color each cycle according to the estimated Gaussian components.
+```{r}
+stable_log_sum_exp <- function(l){
+    ## Compute the log-sum-exp trick
+    l_max <- max(l)
+    return(l_max + log(sum(exp(l - l_max))))
+}
+
+log_l_vector <- function(x, p, Mu, Sigma){
+    ## Compute the vector L(x) with 
+    ## for all i in {1,...,K} L(x)[i] = log rho_i N(x|mu_i,Sigma_i)
+    ## Dimension : K
+    k <- length(p)
+    d <- nrow(as.matrix(x))
+    log_l_m <-  matrix(rep(0, k), ncol=1, nrow=k)
+    for(j in 1:k){
+        log_l <- p[j]
+        log_l <- log_l - d * log(2*pi) / 2
+        log_l <- log_l - t(as.matrix(x-Mu[j,])) %*% 
+          solve(Sigma[,,j]) %*% as.matrix(x-Mu[j,]) / 2
+        log_l <- log_l - logdet(Sigma[,,j]) / 2
+        log_l_m[j,1] <- log_l
+    }
+    return(log_l_m)
+}
+
+log_gamma_vector <- function(x, p, Mu, Sigma){
+    ## Compute the vector logGamma(x) with
+    ## for all i in {1,...,K} logGamma(x)[i] = log (L(x)[i] / sum_j L(x)[j])
+    ## Dimension : K
+    log_l <- log_l_vector(x, p, Mu, Sigma)
+    return(log_l - stable_log_sum_exp(log_l))
+}
+    
+
+gamma_matrix <- function(X, p, Mu, Sigma){
+    ## Compute the matrix Gamma with 
+    ## for all n in {1,...,N} Gamma[i,n] = logGamma(x[n])[i] 
+    ## Dimensions : K x N
+    N <- nrow(X)
+    k <- length(p)
+    log_gamma_m <-  matrix(rep(0, k), ncol=N, nrow=k)
+    for(n in 1:N){
+        log_gamma_m[,n] <- log_gamma_vector(X[n,], p, Mu, Sigma)
+    }
+    return(exp(log_gamma_m))
+}
+
+order_clusters <- function(clusters, X, Mu){
+    k = length(unique(clusters))
+    d <- ncol(X)
+    centroids =  matrix(rep(0, k), ncol=d, nrow=k)
+    for(i in 1:k){
+        mask <- clusters == i
+        centroids[i,] <- apply(X[mask,],2,mean)
+    }
+    clusters_ordered = rep(0,k)
+    clusters_used = rep(0,k)
+    for(i in 1:k){
+        min_dist = Inf
+        ind = 0
+        for(j in 1:k){
+            dist <- sqrt((Mu[j,] - centroids[i,])%*%(Mu[j,] - centroids[i,]))
+            if ((dist < min_dist) & !(j  %in% clusters_used)){
+                min_dist <- dist
+                ind <- j
+            }
+        }
+        clusters_ordered[i] <- ind
+        clusters_used[i] <- ind
+    }
+    return(clusters_ordered)
+}
+```
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+set.seed(seed)
+init <-  initPar(x=X, k=Kfit)
+
+plot(X[,1], X[,2], main='Variational Bayes', xlab=TeX('$X_1$'), ylab=TeX('$X_2$'), col=xi, pch=21)
+if (k_vb == k_true){
+    clusters <- apply(gamma_matrix(X, p_vb, Mu_vb, Sigma_vb),2,which.max)
+    ordered_clusters_unique <- order_clusters(clusters, X, Mu)
+    ordered_clusters <- clusters
+    for (i in 1:k_true){
+        ordered_clusters[which(clusters == i)] <- ordered_clusters_unique[i]
+    }
+    points(X[,1], X[,2], col=ordered_clusters, pch=20)
+}
+points(Mu[,1], Mu[,2], col=5,pch=18,cex=10*p) 
+points(init$Mu[,1], init$Mu[,2], col=6,pch=18,cex=10*init$p)
+for(j in 1:k_vb){
+    points(Mu_vb[j,1], Mu_vb[j,2], col=4, pch=18,cex=10*p_vb[j])
+    ellips <- draw_sd(mu=Mu_vb[j,], sigma=Sigma_vb[,,j])
+    lines(ellips[1,], ellips[2,], col=4)
+}  
+if (k_vb == k_true){
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'Est. component 1','Est. component 2','Est. component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')),  
+           pch=c(21,21,21,20,20,20,18,18,18,NA), col=c(1,2,3,1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,NA,NA,NA,1), ncol=4, cex=0.8)
+    
+}else {
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')), 
+           pch=c(21,21,21,18,18,18,NA), col=c(1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,1), ncol=3, cex=0.8)
+}
+```
+
+## <font color='green'> Question 4 </font> 
+ In this section, we study the influence of the hyper-parameter $\alpha_0$. It can be interpreted as the effective prior number of observations associated with each component of the mixture. If its value is small, then the posterior distribution will be influenced primarily by the data rather than by the prior. In the previous figure, we had $\alpha_0 = 0.1$, this is why the posterior distribution was highly influenced by the dataset and automatically granted negligible weights to two of the estimated components. Let's try to set $\alpha_0 = 0.6$ and to keep $\texttt{Kfit} = 5$.
+```{r, echo=TRUE}
+alpha0 <- 0.6
+m0 <- rep(0,d)
+beta0 <- 0.1
+W0 <- 1*diag(d)
+nu0 <- 10
+Kfit <- 5
+```
+
+```{r, fig.width = 10, fig.height = 5 , fig.align='center'}
+set.seed(seed)
+outputvb <- vbalgo(x=X, k=Kfit, alpha0=alpha0, W0inv=solve(W0), nu0=nu0, m0=m0, beta0=beta0, tol=tol)
+T <- ncol(outputvb$Alphamat)
+plot(outputvb$stopCriteria, main='Stop Criteria over iterations', xlab='Iteration', 
+     ylab='Stop Criteria', col='magenta', pch=20)
+lines(1:T, rep(tol,T), col='red')
+legend("topright", legend=c('Criterion','Tolerance threshold'), lty=c(NA,1),
+           pch=c(20,NA), col=c('magenta','red'), ncol=1, cex=0.8)
+```
+
+```{r}
+p_vb <- outputvb$Alphamat[,T] / sum(outputvb$Alphamat[,T])
+Mu_vb <- outputvb$Marray[,,T]
+Sigma_vb <- array(dim=c(d,d,Kfit))
+for(j in 1:Kfit){
+    Sigma_vb[,,j] <- outputvb$Winvarray[,,j,T] / outputvb$Numat[j,T]
+}
+```
+
+```{r, echo=TRUE}
+T
+p_vb
+outputvb$Marray[,,T]
+```
+Again, two of the estimated components are granted very small weights, which are about ten times higher than the weights we had with $\alpha_0 = 0.1$.
+```{r}
+if (length(which(p_vb<0.001)) > 0){
+    Sigma_vb <- Sigma_vb[,,-which(p_vb<0.001)]
+    Mu_vb <- Mu_vb[-which(p_vb<0.001),]
+    p_vb <- p_vb[-which(p_vb<0.001)]
+}
+k_vb = length(p_vb)
+```
+
+```{r, echo=TRUE}
+k_vb 
+```
+Here, all the estimated components are kept, even if two of them are not significant.
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+set.seed(seed)
+init <-  initPar(x=X, k=Kfit)
+
+plot(X[,1], X[,2], main='Variational Bayes', xlab=TeX('$X_1$'), ylab=TeX('$X_2$'), col=xi, pch=21)
+if (k_vb == k_true){
+    clusters <- apply(gamma_matrix(X, p_vb, Mu_vb, Sigma_vb),2,which.max)
+    ordered_clusters_unique <- order_clusters(clusters, X, Mu)
+    ordered_clusters <- clusters
+    for (i in 1:k_true){
+        ordered_clusters[which(clusters == i)] <- ordered_clusters_unique[i]
+    }
+    points(X[,1], X[,2], col=ordered_clusters, pch=20)
+}
+points(Mu[,1], Mu[,2], col=5,pch=18,cex=10*p) 
+points(init$Mu[,1], init$Mu[,2], col=6,pch=18,cex=10*init$p)
+for(j in 1:k_vb){
+    points(Mu_vb[j,1], Mu_vb[j,2], col=4, pch=18,cex=10*p_vb[j])
+    ellips <- draw_sd(mu=Mu_vb[j,], sigma=Sigma_vb[,,j])
+    lines(ellips[1,], ellips[2,], col=4)
+}  
+if (k_vb == k_true){
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'Est. component 1','Est. component 2','Est. component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')),  
+           pch=c(21,21,21,20,20,20,18,18,18,NA), col=c(1,2,3,1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,NA,NA,NA,1), ncol=4, cex=0.8)
+    
+}else {
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')), 
+           pch=c(21,21,21,18,18,18,NA), col=c(1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,1), ncol=3, cex=0.8)
+}
+```
+Let's check that with $\alpha_0 = 1.2$, we do not obtain a sparse solution. 
+```{r, echo=TRUE}
+alpha0 <- 1.2
+m0 <- rep(0,d)
+beta0 <- 0.1
+W0 <- 1*diag(d)
+nu0 <- 10
+Kfit <- 5
+```
+
+```{r, fig.width = 10, fig.height = 5 , fig.align='center'}
+set.seed(seed)
+outputvb <- vbalgo(x=X, k=Kfit, alpha0=alpha0, W0inv=solve(W0), nu0=nu0, m0=m0, beta0=beta0, tol=tol)
+T <- ncol(outputvb$Alphamat)
+plot(outputvb$stopCriteria, main='Stop Criteria over iterations', xlab='Iteration', 
+     ylab='Stop Criteria', col='magenta', pch=20)
+lines(1:T, rep(tol,T), col='red')
+legend("topright", legend=c('Criterion','Tolerance threshold'), lty=c(NA,1),
+           pch=c(20,NA), col=c('magenta','red'), ncol=1, cex=0.8)
+```
+Higher values of $\alpha_0$ lead to a higher number of iterations to achieve convergence.
+```{r}
+p_vb <- outputvb$Alphamat[,T] / sum(outputvb$Alphamat[,T])
+Mu_vb <- outputvb$Marray[,,T]
+Sigma_vb <- array(dim=c(d,d,Kfit))
+for(j in 1:Kfit){
+    Sigma_vb[,,j] <- outputvb$Winvarray[,,j,T] / outputvb$Numat[j,T]
+}
+```
+
+```{r, echo=TRUE}
+T
+p_vb
+outputvb$Marray[,,T]
+```
+
+```{r}
+if (length(which(p_vb<0.001)) > 0){
+    Sigma_vb <- Sigma_vb[,,-which(p_vb<0.001)]
+    Mu_vb <- Mu_vb[-which(p_vb<0.001),]
+    p_vb <- p_vb[-which(p_vb<0.001)]
+}
+k_vb = length(p_vb)
+```
+
+```{r, echo=TRUE}
+k_vb 
+```
+Again, two of the estimated components are granted small weights, however, this does not lead to a sparse soution.
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+set.seed(seed)
+init <-  initPar(x=X, k=Kfit)
+
+plot(X[,1], X[,2], main='Variational Bayes', xlab=TeX('$X_1$'), ylab=TeX('$X_2$'), col=xi, pch=21)
+if (k_vb == k_true){
+    clusters <- apply(gamma_matrix(X, p_vb, Mu_vb, Sigma_vb),2,which.max)
+    ordered_clusters_unique <- order_clusters(clusters, X, Mu)
+    ordered_clusters <- clusters
+    for (i in 1:k_true){
+        ordered_clusters[which(clusters == i)] <- ordered_clusters_unique[i]
+    }
+    points(X[,1], X[,2], col=ordered_clusters, pch=20)
+}
+points(Mu[,1], Mu[,2], col=5,pch=18,cex=10*p) 
+points(init$Mu[,1], init$Mu[,2], col=6,pch=18,cex=10*init$p)
+for(j in 1:k_vb){
+    points(Mu_vb[j,1], Mu_vb[j,2], col=4, pch=18,cex=10*p_vb[j])
+    ellips <- draw_sd(mu=Mu_vb[j,], sigma=Sigma_vb[,,j])
+    lines(ellips[1,], ellips[2,], col=4)
+}  
+if (k_vb == k_true){
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'Est. component 1','Est. component 2','Est. component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')),  
+           pch=c(21,21,21,20,20,20,18,18,18,NA), col=c(1,2,3,1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,NA,NA,NA,1), ncol=4, cex=0.8)
+    
+}else {
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')), 
+           pch=c(21,21,21,18,18,18,NA), col=c(1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,1), ncol=3, cex=0.8)
+}
+```
+The higher $\alpha_0$ is, the more the posterior distribution is influenced by the prior. With high values, it takes the model more time to converge to the true values and the model is less likely to understand the true number of Gaussian mixture components. However, when $\alpha_0$ is low, the posterior distribution is more influenced by the dataset and the model grants automatically negligible weights to some estimated mixture components so that the true number of components is automatically recoverd.
+
+## <font color='green'> Question 5 </font> 
+
+In this section, we study the influence of the other hyper-parameters $m_0$, $\nu_0$, $\beta_0$ and $W_0$. The first thing to say is that, due to the very accurate initialization, small variations of the hyper-parameters will not change the results of the algorithm, as the parameters are already close to the true mixture distribution. However, if we significantly change their values, we will start to see different behaviors depending on the role of each hyper-parameter. Let's set $\texttt{Kfit} = 3$.
+
+* Let's study the influence of $m_0$ :
+
+$m_0$ is the Gaussian prior mean governing the mean of each Gaussian component. Let's change the value of $m_0$ from $[0\ 0]$ to $[30\ 30]$ :
+```{r, echo=TRUE}
+alpha0 <- 0.1
+m0 <- rep(30,d)
+beta0 <- 0.1
+W0 <- 1*diag(d)
+nu0 <- 10
+Kfit <- k_true
+```
+
+```{r, fig.width = 10, fig.height = 5 , fig.align='center'}
+set.seed(seed)
+outputvb <- vbalgo(x=X, k=Kfit, alpha0=alpha0, W0inv=solve(W0), nu0=nu0, m0=m0, beta0=beta0, tol=tol)
+T <- ncol(outputvb$Alphamat)
+plot(outputvb$stopCriteria, main='Stop Criteria over iterations', xlab='Iteration', 
+     ylab='Stop Criteria', col='magenta', pch=20)
+lines(1:T, rep(tol,T), col='red')
+legend("topright", legend=c('Criterion','Tolerance threshold'), lty=c(NA,1),
+           pch=c(20,NA), col=c('magenta','red'), ncol=1, cex=0.8)
+```
+
+```{r}
+p_vb <- outputvb$Alphamat[,T] / sum(outputvb$Alphamat[,T])
+Mu_vb <- outputvb$Marray[,,T]
+Sigma_vb <- array(dim=c(d,d,Kfit))
+for(j in 1:Kfit){
+    Sigma_vb[,,j] <- outputvb$Winvarray[,,j,T] / outputvb$Numat[j,T]
+}
+k_vb <- Kfit
+```
+
+```{r, echo=TRUE}
+T
+p_vb
+Mu_vb
+Sigma_vb
+```
+When looking at the estimated Gaussian components' means, we observe that one of the estimated component converges over iterations to a big component wrapping the entire dataset. Indeed, its mean corresponds approximately to the mean of the dataset. The other estimated components shrink over iterations and end up around the same position $[30\ \ 30]$ with a large precision. Therefore, those components do not contain any data point. This is due to the fact that $m_0$ was initialized far from any value of the dataset. Let's plot the results :
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+set.seed(seed)
+init <-  initPar(x=X, k=Kfit)
+
+plot(X[,1], X[,2], main='Variational Bayes', xlab=TeX('$X_1$'), ylab=TeX('$X_2$'), col=xi, pch=21)
+points(Mu[,1], Mu[,2], col=5,pch=18,cex=10*p) 
+points(init$Mu[,1], init$Mu[,2], col=6,pch=18,cex=10*init$p)
+for(j in 1:k_vb){
+    points(Mu_vb[j,1], Mu_vb[j,2], col=4, pch=18,cex=10*p_vb[j])
+    ellips <- draw_sd(mu=Mu_vb[j,], sigma=Sigma_vb[,,j])
+    lines(ellips[1,], ellips[2,], col=4)
+}  
+legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                              'True centroids', 'Init centroids',
+                              'VB centroids', TeX('VB $0.95$ quantiles')), 
+       pch=c(21,21,21,18,18,18,NA), col=c(1,2,3,5,6,4,4), 
+       lty=c(NA,NA,NA,NA,NA,NA,1), ncol=3, cex=0.8)
+
+```
+
+* Let's study the influence of $\nu_0$ :
+
+$\nu_0$ is a Wishart prior parameter governing the precision of each Gaussian component. Let's change the value of $\nu_0$ from $10$ to $300$ :
+```{r, echo=TRUE}
+alpha0 <- 0.1
+m0 <- rep(0,d)
+beta0 <- 0.1
+W0 <- 1*diag(d)
+nu0 <- 300
+Kfit <- k_true
+```
+
+```{r, fig.width = 10, fig.height = 5 , fig.align='center'}
+set.seed(seed)
+outputvb <- vbalgo(x=X, k=Kfit, alpha0=alpha0, W0inv=solve(W0), nu0=nu0, m0=m0, beta0=beta0, tol=tol)
+T <- ncol(outputvb$Alphamat)
+plot(outputvb$stopCriteria, main='Stop Criteria over iterations', xlab='Iteration', 
+     ylab='Stop Criteria', col='magenta', pch=20)
+lines(1:T, rep(tol,T), col='red')
+legend("topright", legend=c('Criterion','Tolerance threshold'), lty=c(NA,1),
+           pch=c(20,NA), col=c('magenta','red'), ncol=1, cex=0.8)
+```
+With $\nu_0 = 300$, the convergence is achieved pretty quickly.
+```{r}
+p_vb <- outputvb$Alphamat[,T] / sum(outputvb$Alphamat[,T])
+Mu_vb <- outputvb$Marray[,,T]
+Sigma_vb <- array(dim=c(d,d,Kfit))
+for(j in 1:Kfit){
+    Sigma_vb[,,j] <- outputvb$Winvarray[,,j,T] / outputvb$Numat[j,T]
+}
+```
+
+```{r}
+if (length(which(p_vb<0.001)) > 0){
+    Sigma_vb <- Sigma_vb[,,-which(p_vb<0.001)]
+    Mu_vb <- Mu_vb[-which(p_vb<0.001),]
+    p_vb <- p_vb[-which(p_vb<0.001)]
+}
+k_vb = length(p_vb)
+```
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+set.seed(seed)
+init <-  initPar(x=X, k=Kfit)
+
+plot(X[,1], X[,2], main='Variational Bayes', xlab=TeX('$X_1$'), ylab=TeX('$X_2$'), col=xi, pch=21)
+if (k_vb == k_true){
+    clusters <- apply(gamma_matrix(X, p_vb, Mu_vb, Sigma_vb),2,which.max)
+    ordered_clusters_unique <- order_clusters(clusters, X, Mu)
+    ordered_clusters <- clusters
+    for (i in 1:k_true){
+        ordered_clusters[which(clusters == i)] <- ordered_clusters_unique[i]
+    }
+    points(X[,1], X[,2], col=ordered_clusters, pch=20)
+}
+points(Mu[,1], Mu[,2], col=5,pch=18,cex=10*p) 
+points(init$Mu[,1], init$Mu[,2], col=6,pch=18,cex=10*init$p)
+for(j in 1:k_vb){
+    points(Mu_vb[j,1], Mu_vb[j,2], col=4, pch=18,cex=10*p_vb[j])
+    ellips <- draw_sd(mu=Mu_vb[j,], sigma=Sigma_vb[,,j])
+    lines(ellips[1,], ellips[2,], col=4)
+}  
+if (k_vb == k_true){
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'Est. component 1','Est. component 2','Est. component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')),  
+           pch=c(21,21,21,20,20,20,18,18,18,NA), col=c(1,2,3,1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,NA,NA,NA,1), ncol=4, cex=0.8)
+    
+}else {
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')), 
+           pch=c(21,21,21,18,18,18,NA), col=c(1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,1), ncol=3, cex=0.8)
+}
+```
+
+Let's change $\nu_0$ from $300$ to $1$ :
+```{r, echo=TRUE}
+alpha0 <- 0.1
+m0 <- rep(0,d)
+beta0 <- 0.1
+W0 <- 1*diag(d)
+nu0 <- 1
+Kfit <- k_true
+```
+
+```{r, fig.width = 10, fig.height = 5 , fig.align='center'}
+set.seed(seed)
+outputvb <- vbalgo(x=X, k=Kfit, alpha0=alpha0, W0inv=solve(W0), nu0=nu0, m0=m0, beta0=beta0, tol=tol)
+T <- ncol(outputvb$Alphamat)
+plot(outputvb$stopCriteria, main='Stop Criteria over iterations', xlab='Iteration', 
+     ylab='Stop Criteria', col='magenta', pch=20)
+lines(1:T, rep(tol,T), col='red')
+legend("topright", legend=c('Criterion','Tolerance threshold'), lty=c(NA,1),
+           pch=c(20,NA), col=c('magenta','red'), ncol=1, cex=0.8)
+```
+With $\nu_0 = 1$, the model takes more time to converge.
+```{r}
+p_vb <- outputvb$Alphamat[,T] / sum(outputvb$Alphamat[,T])
+Mu_vb <- outputvb$Marray[,,T]
+Sigma_vb <- array(dim=c(d,d,Kfit))
+for(j in 1:Kfit){
+    Sigma_vb[,,j] <- outputvb$Winvarray[,,j,T] / outputvb$Numat[j,T]
+}
+```
+
+```{r}
+if (length(which(p_vb<0.001)) > 0){
+    Sigma_vb <- Sigma_vb[,,-which(p_vb<0.001)]
+    Mu_vb <- Mu_vb[-which(p_vb<0.001),]
+    p_vb <- p_vb[-which(p_vb<0.001)]
+}
+k_vb = length(p_vb)
+```
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+set.seed(seed)
+init <-  initPar(x=X, k=Kfit)
+
+plot(X[,1], X[,2], main='Variational Bayes', xlab=TeX('$X_1$'), ylab=TeX('$X_2$'), col=xi, pch=21)
+if (k_vb == k_true){
+    clusters <- apply(gamma_matrix(X, p_vb, Mu_vb, Sigma_vb),2,which.max)
+    ordered_clusters_unique <- order_clusters(clusters, X, Mu)
+    ordered_clusters <- clusters
+    for (i in 1:k_true){
+        ordered_clusters[which(clusters == i)] <- ordered_clusters_unique[i]
+    }
+    points(X[,1], X[,2], col=ordered_clusters, pch=20)
+}
+points(Mu[,1], Mu[,2], col=5,pch=18,cex=10*p) 
+points(init$Mu[,1], init$Mu[,2], col=6,pch=18,cex=10*init$p)
+for(j in 1:k_vb){
+    points(Mu_vb[j,1], Mu_vb[j,2], col=4, pch=18,cex=10*p_vb[j])
+    ellips <- draw_sd(mu=Mu_vb[j,], sigma=Sigma_vb[,,j])
+    lines(ellips[1,], ellips[2,], col=4)
+}  
+if (k_vb == k_true){
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'Est. component 1','Est. component 2','Est. component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')),  
+           pch=c(21,21,21,20,20,20,18,18,18,NA), col=c(1,2,3,1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,NA,NA,NA,1), ncol=4, cex=0.8)
+    
+}else {
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')), 
+           pch=c(21,21,21,18,18,18,NA), col=c(1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,1), ncol=3, cex=0.8)
+}
+```
+When the hyper-paramter $\nu_0$ is very high, the posterior estimate $\Sigma_{1:k}$ has low values and the algorithm converges quickly. However, when $\nu_0$ is very low, the posterior estimate $\Sigma_{1:k}$ has high values and the algorithm takes more time to converge.
+
+* Let's study the influence of $\beta_0$ :
+
+$\beta_0$ is a Gaussian prior parameter governing the variance of the mean of each Gaussian component. 
+Let's change the value of $\beta_0$ from $0.1$ to $30$ : 
+```{r, echo=TRUE}
+alpha0 <- 0.1
+m0 <- rep(0,d)
+beta0 <- 30
+W0 <- 1*diag(d)
+nu0 <- 10
+Kfit <- k_true
+```
+
+```{r, fig.width = 10, fig.height = 5 , fig.align='center'}
+set.seed(seed)
+outputvb <- vbalgo(x=X, k=Kfit, alpha0=alpha0, W0inv=solve(W0), nu0=nu0, m0=m0, beta0=beta0, tol=tol)
+T <- ncol(outputvb$Alphamat)
+plot(outputvb$stopCriteria, main='Stop Criteria over iterations', xlab='Iteration', 
+     ylab='Stop Criteria', col='magenta', pch=20)
+lines(1:T, rep(tol,T), col='red')
+legend("topright", legend=c('Criterion','Tolerance threshold'), lty=c(NA,1),
+           pch=c(20,NA), col=c('magenta','red'), ncol=1, cex=0.8)
+```
+With $\beta_0 = 30$, the model takes more time to converge.
+```{r}
+p_vb <- outputvb$Alphamat[,T] / sum(outputvb$Alphamat[,T])
+Mu_vb <- outputvb$Marray[,,T]
+Sigma_vb <- array(dim=c(d,d,Kfit))
+for(j in 1:Kfit){
+    Sigma_vb[,,j] <- outputvb$Winvarray[,,j,T] / outputvb$Numat[j,T]
+}
+```
+
+```{r}
+if (length(which(p_vb<0.001)) > 0){
+    Sigma_vb <- Sigma_vb[,,-which(p_vb<0.001)]
+    Mu_vb <- Mu_vb[-which(p_vb<0.001),]
+    p_vb <- p_vb[-which(p_vb<0.001)]
+}
+k_vb = length(p_vb)
+```
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+set.seed(seed)
+init <-  initPar(x=X, k=Kfit)
+
+plot(X[,1], X[,2], main='Variational Bayes', xlab=TeX('$X_1$'), ylab=TeX('$X_2$'), col=xi, pch=21)
+if (k_vb == k_true){
+    clusters <- apply(gamma_matrix(X, p_vb, Mu_vb, Sigma_vb),2,which.max)
+    ordered_clusters_unique <- order_clusters(clusters, X, Mu)
+    ordered_clusters <- clusters
+    for (i in 1:k_true){
+        ordered_clusters[which(clusters == i)] <- ordered_clusters_unique[i]
+    }
+    points(X[,1], X[,2], col=ordered_clusters, pch=20)
+}
+points(Mu[,1], Mu[,2], col=5,pch=18,cex=10*p) 
+points(init$Mu[,1], init$Mu[,2], col=6,pch=18,cex=10*init$p)
+for(j in 1:k_vb){
+    points(Mu_vb[j,1], Mu_vb[j,2], col=4, pch=18,cex=10*p_vb[j])
+    ellips <- draw_sd(mu=Mu_vb[j,], sigma=Sigma_vb[,,j])
+    lines(ellips[1,], ellips[2,], col=4)
+}  
+if (k_vb == k_true){
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'Est. component 1','Est. component 2','Est. component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')),  
+           pch=c(21,21,21,20,20,20,18,18,18,NA), col=c(1,2,3,1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,NA,NA,NA,1), ncol=4, cex=0.8)
+    
+}else {
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')), 
+           pch=c(21,21,21,18,18,18,NA), col=c(1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,1), ncol=3, cex=0.8)
+}
+```
+$\beta_0$ changes the initialization of the mean of each mixture component as their variances are inversely proportional to $\beta_0$. Therefore, the initial mean values are redefined from an optimal position (the centers of three clusters after the k-means algorithm) to a different position. Therefore, the algorithm evolves finding new components, different from the true Gaussian components, and this might as well explain why it takes a longer time to converge, as the initial mean values are not close to the true Gaussian components.
+
+* Let's study the influence of $W_0$ :
+
+$W_0$ is a Wishart prior parameter governing the precision of each Gaussian component. Let's change the value of $W_0$ from $1*diag(2)$ to $1000*diag(2)$ :
+```{r, echo=TRUE}
+alpha0 <- 0.1
+m0 <- rep(0,d)
+beta0 <- 0.1
+W0 <- 1000*diag(d)
+nu0 <- 10
+Kfit <- k_true
+```
+
+```{r, fig.width = 10, fig.height = 5 , fig.align='center'}
+set.seed(seed)
+outputvb <- vbalgo(x=X, k=Kfit, alpha0=alpha0, W0inv=solve(W0), nu0=nu0, m0=m0, beta0=beta0, tol=tol)
+T <- ncol(outputvb$Alphamat)
+plot(outputvb$stopCriteria, main='Stop Criteria over iterations', xlab='Iteration', 
+     ylab='Stop Criteria', col='magenta', pch=20)
+lines(1:T, rep(tol,T), col='red')
+legend("topright", legend=c('Criterion','Tolerance threshold'), lty=c(NA,1),
+           pch=c(20,NA), col=c('magenta','red'), ncol=1, cex=0.8)
+```
+
+```{r}
+p_vb <- outputvb$Alphamat[,T] / sum(outputvb$Alphamat[,T])
+Mu_vb <- outputvb$Marray[,,T]
+Sigma_vb <- array(dim=c(d,d,Kfit))
+for(j in 1:Kfit){
+    Sigma_vb[,,j] <- outputvb$Winvarray[,,j,T] / outputvb$Numat[j,T]
+}
+```
+
+```{r}
+if (length(which(p_vb<0.001)) > 0){
+    Sigma_vb <- Sigma_vb[,,-which(p_vb<0.001)]
+    Mu_vb <- Mu_vb[-which(p_vb<0.001),]
+    p_vb <- p_vb[-which(p_vb<0.001)]
+}
+k_vb = length(p_vb)
+```
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+set.seed(seed)
+init <-  initPar(x=X, k=Kfit)
+
+plot(X[,1], X[,2], main='Variational Bayes', xlab=TeX('$X_1$'), ylab=TeX('$X_2$'), col=xi, pch=21)
+if (k_vb == k_true){
+    clusters <- apply(gamma_matrix(X, p_vb, Mu_vb, Sigma_vb),2,which.max)
+    ordered_clusters_unique <- order_clusters(clusters, X, Mu)
+    ordered_clusters <- clusters
+    for (i in 1:k_true){
+        ordered_clusters[which(clusters == i)] <- ordered_clusters_unique[i]
+    }
+    points(X[,1], X[,2], col=ordered_clusters, pch=20)
+}
+points(Mu[,1], Mu[,2], col=5,pch=18,cex=10*p) 
+points(init$Mu[,1], init$Mu[,2], col=6,pch=18,cex=10*init$p)
+for(j in 1:k_vb){
+    points(Mu_vb[j,1], Mu_vb[j,2], col=4, pch=18,cex=10*p_vb[j])
+    ellips <- draw_sd(mu=Mu_vb[j,], sigma=Sigma_vb[,,j])
+    lines(ellips[1,], ellips[2,], col=4)
+}  
+if (k_vb == k_true){
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'Est. component 1','Est. component 2','Est. component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')),  
+           pch=c(21,21,21,20,20,20,18,18,18,NA), col=c(1,2,3,1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,NA,NA,NA,1), ncol=4, cex=0.8)
+    
+}else {
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'VB centroids', TeX('VB $0.95$ quantiles')), 
+           pch=c(21,21,21,18,18,18,NA), col=c(1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,1), ncol=3, cex=0.8)
+}
+```
+We do not observe any big impact when changing the hyper-parameter $W_0$.
+
+To sum up, only significant variations of those hyper-parameters have a real impact on the solutions.
+
+# <font color='color'>  Metropolis-Hastings algorithm </font> 
+
+In this section, we will try to estimate the mixture distribution using the Metropolis-Hastings algorithm.
+
+The algorithm works by simulating a Markov chain whose stationary distribution is $\pi$. We know $\tilde \pi = \lambda \pi$ but $\lambda$ is unknown. The algorithm is the following :
+
+* We provide a transition kernel with density $q(\theta^{*}|\theta)$ on $\Theta$.
+
+* We choose a prior to initialize $\theta^{0}$.
+
+* We iterate until we reach the stopping criterion : 
+
+  * We sample $\theta^{*}$ from $q(\theta^{*}|\theta^{t})$, which is the proposed value for $\theta^{t+1}$;
+
+  * Acceptancy probability : we compute 
+
+$$ 
+\alpha = \min\bigg( 1,\frac{\tilde \pi (\theta^{*}) q(\theta^{t}|\theta^{*})}{\tilde \pi (\theta^{t})  q(\theta^{*}|\theta^{t})} \bigg) 
+$$
+
+  * With probability $\alpha$, we accept the proposed value and set $\theta^{t+1} = \theta^{*}$, and otherwise we set $\theta^{t+1} = \theta^{t}$.
+
+The prior density is implemented in the function $\texttt{dprior}$. The proposal kernel at current state $\theta^{t} = (\rho_{1:k}^t,\mu_{1:k}^t,\Sigma_{1:k}^t)$ is $Q_{\textrm{MH}}(\theta^t,\theta^{*})$, generating a proposal $\theta^{*} = (\rho_{1:k}^{*},\mu_{1:k}^{*},\Sigma_{1:k}^{*})$ as follows :
+
+* $\rho^{*} \sim \textrm{Diri}(\alpha_p \textrm{ x } \alpha^t)$ where $\alpha_p>0$;
+
+* $\mu_j^{*} \sim \mathcal{N}(\mu_j^t, \sigma_{\mu}^2I_d)$ where $\sigma_{\mu}^2$ is a variance parameter;
+
+* $\Sigma_j^{*} \sim \mathcal{W}(\nu_{\Sigma}, (\nu_{\Sigma})^{-1}\Sigma_j^t)$ where $\nu_{\Sigma}$ is a degree of freedom parameter fixed by user. Thus $\mathbb{E}_{Q_{\textrm{MH}}}(\Sigma_j^{*}|\Sigma_j^t) = \Sigma_j^t$ and the distribution of $\Sigma_j^{*}$ is more peaked around $\Sigma_j^t$ for large values of $\nu_{\Sigma}$.
+
+## <font color='green'> Question 1 </font> 
+
+We complete the function $\texttt{rproposal}$ as follows :
+```{r}
+rproposal <- function( Mu, Sigma, p, ppar=list(var_Mu = 0.1,
+                                               nu_Sigma = 10,
+                                               alpha_p = 10))
+    #' random generator according to a proposal kernel centered at the current value.
+    #' Mu, Sigma, p: current mixture parameters, see gmllk.
+    #' ppar: a list made of :
+    #' - var_Mu: variance parameter for the Gaussian kernel for Mu.
+    #' - nu_Sigma: degrees of freedom for the Wihart kernel for Sigma
+    #' - alpha_p: concentration aprameter for the Dirichlet kernel for p
+    #' returns: a list fo proposal parameters: (Mu, Sigma, p), where 
+    #'   p ~ dirichlet(Alpha) with mean = Alpha/sum(Alpha) = current p and
+    #'   concentration parameter sum(Alpha) = alpha_p.
+    #' Mu : a k*d matrix and Sigma: a d*d*k array: 
+    #'   for j in 1:k,  Mu[j,]~ Normal(mean= current Mu[j,], covariance = var_Mu*Identity)
+    #'   Sigma[,,j]~ Wishart(W = 1/nu_Sigma * current Sigma[,,j] ; nu = nu_Sigma)
+    
+{
+    d <- ncol(Mu)
+    k <- length(p)
+    alphaProp <- sapply(ppar$alpha_p * p, function(x){max(x,1e-30)})
+    ## this avoids numerical errors
+
+    p <- rdirichlet(n=1, alpha = alphaProp)
+    p <- sapply(p, function(x){max(x,1e-30)})
+    p <- p/sum(p)
+    for(j in (1:k))
+    {
+      ## complete the code. use function rmvn 
+      # Mu : a k*d matrix: 
+      # for j in 1:k,  Mu[j,]~ Normal(mean= current Mu[j,], covariance = var_Mu*Identity)
+      Mu[j,] <- rmvn(mu=Mu[j,], Sigma=ppar$var_Mu*diag(d))
+      ## complete the code. use function rwishart
+      # Sigma: a d*d*k array
+      # Sigma[,,j]~ Wishart(W = 1/nu_Sigma * current Sigma[,,j] ; nu = nu_Sigma)
+      Sigma[,,j] <- rwishart(nu=ppar$nu_Sigma, S=Sigma[,,j]/ppar$nu_Sigma)
+    }
+    return(list(Mu = Mu, Sigma = Sigma, p = p))
+}
+```
+```{r, eval=FALSE, echo=TRUE, include=TRUE}
+Mu[j,] <- rmvn(mu=Mu[j,], Sigma=ppar$var_Mu*diag(d))
+Sigma[,,j] <- rwishart(nu=ppar$nu_Sigma, S=Sigma[,,j]/ppar$nu_Sigma)
+```
+
+
+## <font color='green'> Question 2 </font> 
+We have :
+$$
+q_{\textrm{MH}}(\theta^t|\theta^{*}) = q_{\textrm{MH}}(\rho_{1:k}^t|\rho_{1:k}^{*}) q_{\textrm{MH}}(\mu_{1:k}^t|\mu_{1:k}^{*}) q_{\textrm{MH}}(\Sigma_{1:k}^t|\Sigma_{1:k}^{*})
+$$
+Therefore 
+
+$$
+\log q_{\textrm{MH}}(\theta^t|\theta^{*}) = \log q_{\textrm{MH}}(\rho_{1:k}^t|\rho_{1:k}^{*}) + \log  q_{\textrm{MH}}(\mu_{1:k}^t|\mu_{1:k}^{*}) + \log q_{\textrm{MH}}(\Sigma_{1:k}^t|\Sigma_{1:k}^{*})
+$$
+and 
+$$
+\begin{aligned}
+ \log \alpha = \min\big(0,&\log \tilde \pi (\theta^{*}) + \log q_{\textrm{MH}}(\rho_{1:k}^t|\rho_{1:k}^{*}) + \log  q_{\textrm{MH}}(\mu_{1:k}^t|\mu_{1:k}^{*}) + \log q_{\textrm{MH}}(\Sigma_{1:k}^t|\Sigma_{1:k}^{*}) \\
+ - &\log \tilde \pi (\theta^{t}) - \log  q_{\textrm{MH}}(\rho_{1:k}^{*}|\rho_{1:k}^t) + \log  q_{\textrm{MH}}(\mu_{1:k}^{*}|\mu_{1:k}^t) + \log q_{\textrm{MH}}(\Sigma_{1:k}^{*}|\Sigma_{1:k}^t)\big)
+\end{aligned}
+$$
+However $\forall j \in \{1,...,k\}$, $\mu_j^{*} \sim \mathcal{N}(\mu_j^t, \sigma_{\mu}^2I_d)$ and $\mu_j^{t} \sim \mathcal{N}(\mu_j^{*}, \sigma_{\mu}^2I_d)$ therefore $q_{\textrm{MH}}(\mu_{j}^{*}|\mu_{j}^t) = q_{\textrm{MH}}(\mu_{j}^t|\mu_{j}^{*})$. 
+
+Finally we have :
+$$
+\begin{aligned}
+ \log \alpha = \min\big(0,&\log \tilde \pi (\theta^{*}) + \log q_{\textrm{MH}}(\rho_{1:k}^t|\rho_{1:k}^{*}) + \log q_{\textrm{MH}}(\Sigma_{1:k}^t|\Sigma_{1:k}^{*}) \\
+ - &\log \tilde \pi (\theta^{t}) - \log  q_{\textrm{MH}}(\rho_{1:k}^{*}|\rho_{1:k}^t) + \log q_{\textrm{MH}}(\Sigma_{1:k}^{*}|\Sigma_{1:k}^t)\big)
+\end{aligned}
+$$
+
+Therefore, we complete the function $\texttt{MHsample}$ as follows :
+```{r}
+gmllk <- function(x , Mu , Sigma , p){
+    #' Log-likelihood in the Gaussian mixture model. 
+    #' x: dataset: a n*d matrix for n points with d features each.
+    #' Mu: a k*d matrix with k the number of components: the centers
+    #' Sigma: a d*d*k array:: the convariance matrices.
+    #' p: a vector of length k: the mixture weights
+    #' returns:  the log-likelihood (single number)
+    k <- length(p)
+    if(is.vector(x)){
+        x <- matrix(x, nrow=1)}
+    n <- nrow(x)
+    mat_dens <- vapply(1:k, function(j){
+        dmnorm(x, mean = Mu[j,], varcov = Sigma[,,j], log=FALSE)
+    }, FUN.VALUE = numeric(n)) ##  n rows, k columns.
+    if(is.vector(mat_dens)){
+        mat_dens <- matrix(mat_dens, nrow = 1)
+    }
+    vect_dens <-   mat_dens%*%matrix(p,ncol=1) ## vector of size n
+    return(sum(log(vect_dens)))
+}
+
+dprior <- function( Mu, Sigma, p,
+                   hpar = list( alpha0= 1,
+                               m0 = rep(0, ncol(Mu)), beta0 = 1, 
+                               W0 = diag(ncol(Mu)), nu0 = ncol(Mu)))
+    #'log-prior density on (Mu, Sigma, p)
+    #' Mu, Sigma, p: see gmllk
+    #' hpar: a list of hyper-parameters composed of
+    #' - alpha0> 0 : isotropic dirichlet prior on p
+    #' - m0: a d vector: mean parameter for the Gaussian-Wishart prior on Mu
+    #' - beta0: a single number >0: scale parameter for the Gaussian-Wishart prior on Mu
+    #' - W0: covariance parameter for the inverse-wishart distribution on Sigma
+    #' - nu0: degrees of freedom >d-1 for the wishart distribution on Sigma.  
+{
+    d <- ncol(Mu)
+    k <- length(p)
+    prior_p <- ddirichlet(p, alpha= rep(hpar$alpha0, k), log = TRUE)
+    prior_MuSigma <- sum(sapply(1:k, function(j){
+        dnorminvwishart(mu = Mu[j,], mu0 = hpar$m0, lambda = hpar$beta0,
+                        Sigma = Sigma[,,j], S = hpar$W0, nu = hpar$nu0,
+                        log = TRUE)}))
+    return(prior_p + prior_MuSigma)
+}
+
+MHsample <- function(x, k, nsample,
+                     init=list(Mu = matrix(0,ncol=ncol(x), nrow=k ),
+                               Sigma = array(rep(diag(ncol(x)), k),
+                                             dim=c(ncol(x), ncol(x), k)),
+                               p = rep(1/k, k)),
+                     hpar= list( alpha0= 1, 
+                                m0 = rep(0, ncol(Mu)), beta0 = 1, 
+                                W0 = diag(ncol(Mu)), nu0 = ncol(Mu)),
+                     ppar = list(var_Mu = 0.1,
+                                 nu_Sigma = 10,
+                                 alpha_p = 10) )
+    #' x: the data. A n*d matrix.
+    #' k: the number of mixture components.
+    #' nsample: number of MCMC iterations
+    #' init: starting value for the the MCMC. Format: list(Mu, Sigma, p), see gmllk for details
+    #' hpar: a list of hyper-parameter for the prior: see dprior.
+    #' ppar: a list of parameter for the proposal: see rproposal.
+    #' returns: a sample produced by the Metropolis-Hastings algorithm, together with
+    #' the log-posterior density (unnormalized) across iterations, and number of acepted proposals.  as a list composed of
+    #' - p: a k*nsample matrix
+    #' - Mu: a k*d*nsample array
+    #' - Sigma: a d*d*k*nsample array
+    #' - lpostdens: the log posterior density (vector of size nsample)
+    #' - naccept! number of accepted proposals. 
+{
+    d <- ncol(x)
+    output <- list(p = matrix(nrow=k, ncol=nsample),
+                   Mu = array(dim = c(k, d, nsample)),
+                   Sigma = array(dim = c(d, d ,k, nsample)),
+                   lpostdens = rep(0, nsample),
+                   naccept = 0
+                   )
+    current <- init
+    current$lpost <- gmllk(x=x, Mu=current$Mu,
+                            Sigma = current$Sigma, p=current$p) +
+        dprior(Mu = current$Mu, Sigma = current$Sigma, p = current$p,
+               hpar = hpar)
+    ## lpost: logarithm of the unnormalized posterior density.
+    for (niter in 1:nsample){
+        proposal <- rproposal(Mu = current$Mu, Sigma = current$Sigma, p=current$p,
+                              ppar = ppar)
+
+        proposal$lpost <- gmllk(x=x, Mu=proposal$Mu,
+                                Sigma = proposal$Sigma, p=proposal$p) +
+            dprior(Mu = proposal$Mu, Sigma = proposal$Sigma, p = proposal$p,
+                   hpar = hpar)
+    
+        llkmoveSigma <- sum(vapply(1:k, FUN = function(j){
+            dwishart(Omega =proposal$Sigma[,,j], nu=ppar$nu_Sigma,
+                     S = 1/ppar$nu_Sigma * current$Sigma[,,j] , log=TRUE)},
+            FUN.VALUE = numeric(1)))
+
+        llkbackSigma <- sum(vapply(1:k, FUN = function(j){
+            dwishart(Omega=current$Sigma[,,j], nu=ppar$nu_Sigma,
+                     S=1/ppar$nu_Sigma * proposal$Sigma[,,j] , log=TRUE)},
+            FUN.VALUE = numeric(1)))
+        alphaPropmove <- sapply(ppar$alpha_p * current$p, function(x){max(x,1e-30)})
+        alphaPropback <- sapply(ppar$alpha_p * proposal$p, function(x){max(x,1e-30)})
+        ## logarithm of the acceptance ratio.
+        ## Complete the code using
+        ## lproposal$lpost,  current$lpost,
+        ## ddirichlet( ... , log=TRUE), llkbackSigma and llkmovesigma.
+        llkmoveRho <- ddirichlet(x=proposal$p, alpha=alphaPropmove, log=TRUE)
+        llkbackRho <- ddirichlet(x=current$p, alpha=alphaPropback, log=TRUE)
+  
+        lacceptratio <- min(0, proposal$lpost - current$lpost + 
+                              llkbackRho - llkmoveRho +
+                              llkbackSigma - llkmoveSigma)
+
+        U <- runif(1)
+        if(U < exp(lacceptratio)){
+            current <- proposal
+            output$naccept <- output$naccept + 1
+        }
+        output$p[,niter] <- current$p
+        output$Mu[,,niter] <- current$Mu
+        output$Sigma[,,,niter] <- current$Sigma
+        output$lpostdens[niter] <- current$lpost            
+    }
+    return(output)
+} 
+```
+
+```{r, eval=FALSE, echo=TRUE, include=TRUE}
+llkmoveRho <- ddirichlet(x=proposal$p, alpha=alphaPropmove, log=TRUE)
+llkbackRho <- ddirichlet(x=current$p, alpha=alphaPropback, log=TRUE)
+
+lacceptratio <- min(0, proposal$lpost - current$lpost + 
+                      llkbackRho - llkmoveRho +
+                      llkbackSigma - llkmoveSigma)
+```
+
+## <font color='green'> Question 3 </font> 
+
+Let's look at the hyper-parameter values :
+```{r, echo=TRUE}
+alpha0 <- 0.1
+m0 <- rep(0,d)
+beta0 <- 0.1
+W0 <- 1*diag(d)
+nu0 <- 10
+nsample <- 3000
+Kmc <- 3
+hpar <- list( alpha0= alpha0, m0=m0, beta0=beta0, W0=W0, nu0=nu0)
+ppar <- list(var_Mu=0.001, nu_Sigma=500, alpha_p=500) 
+```
+Let's test our code with $3000$ iterations :
+```{r}
+set.seed(seed)
+init <- initPar(x=X, k=Kmc)
+
+set.seed(1)
+pct <- proc.time()
+outputmh <- MHsample(x=X, k=Kmc, nsample=nsample, init=init, hpar=hpar, ppar=ppar)
+newpct <- proc.time()
+elapsed <- newpct - pct
+```
+
+```{r, echo=TRUE}
+elapsed
+outputmh$naccept ## should not be ridiculously low. 
+```
+Among $3000$ iterations, we only have a few proposed values that were accepted.
+
+Let's take a look at the mixture distribution estimate :
+```{r}
+p_mh <- outputmh$p[,nsample]
+Mu_mh <- outputmh$Mu[,,nsample]
+Sigma_mh <- outputmh$Sigma[,,,nsample]
+
+if (length(which(p_mh<0.001)) > 0){
+    Sigma_mh <- Sigma_mh[,,-which(p_mh<0.001)]
+    Mu_mh <- Mu_mh[-which(p_mh<0.001),]
+    p_mh <- p_mh[-which(p_mh<0.001)]
+}
+k_mh = length(p_mh)
+```
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+set.seed(seed)
+init <- initPar(x=X, k=Kmc)
+
+plot(X[,1], X[,2], main='Metropolis-Hastings', xlab=TeX('$X_1$'), ylab=TeX('$X_2$'), col=xi, pch=21)
+if (k_mh == k_true){
+    clusters <- apply(gamma_matrix(X, p_mh, Mu_mh, Sigma_mh),2,which.max)
+    ordered_clusters_unique <- order_clusters(clusters, X, Mu)
+    ordered_clusters <- clusters
+    for (i in 1:k_true){
+        ordered_clusters[which(clusters == i)] <- ordered_clusters_unique[i]
+    }
+    points(X[,1], X[,2], col=ordered_clusters, pch=20)
+}
+points(Mu[,1], Mu[,2], col=5,pch=18,cex=10*p) 
+points(init$Mu[,1], init$Mu[,2], col=6,pch=18,cex=10*init$p)
+for(j in 1:k_mh){
+    points(Mu_mh[j,1], Mu_mh[j,2], col=4, pch=18,cex=10*p_mh[j])
+    ellips <- draw_sd(mu=Mu_mh[j,], sigma=Sigma_mh[,,j])
+    lines(ellips[1,], ellips[2,], col=4)
+}  
+if (k_mh == k_true){
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'Est. component 1','Est. component 2','Est. component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'MH centroids', TeX('MH $0.95$ quantiles')),  
+           pch=c(21,21,21,20,20,20,18,18,18,NA), col=c(1,2,3,1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,NA,NA,NA,1), ncol=4, cex=0.8)
+    
+}else {
+    legend("topright", legend = c('True component 1','True component 2','True component 3', 
+                                  'True centroids', 'Init centroids',
+                                  'MH centroids', TeX('MH $0.95$ quantiles')), 
+           pch=c(21,21,21,18,18,18,NA), col=c(1,2,3,5,6,4,4), 
+           lty=c(NA,NA,NA,NA,NA,NA,1), ncol=3, cex=0.8)
+}
+```
+The Metropolis-Hastings algorithm provides also good results for mixture distribution estimation.
+
+## <font color='green'> Question 4 </font> 
+
+Relevant numerical summaries can be constructed, such as the value of the cumulative distribution function ($\textit{cdf}$) at a given point $y = (y_1,...,y_d)$,
+$$
+F(y|\rho_{1:k}^t,\mu_{1:k}^t,\Sigma_{1:k}^t) = \mathbb{P}(X_1\leq y_1,...,X_d\leq y_d|\rho_{1:k}^t,\mu_{1:k}^t,\Sigma_{1:k}^t),\ t\in (1,...,N_\textrm{sample})
+$$
+where $N_\textrm{sample}$ is the number of iterations.
+```{r}
+gmcdf <- function(x, Mu, Sigma, p)
+    #' multivariate cumulative distribution function in a GMM. 
+    #' x: a single point (vector of size d)
+    #' Mu, Sigma, p: see gmllk.
+    #' returns: the cdf at point x. 
+{
+    k <- length(p)
+    vect_cdf <- vapply(1:k, function(j){
+        pmnorm(x, mean = Mu[j,], varcov = Sigma[,,j])
+    }, FUN.VALUE = numeric(1))
+    return(sum(p*vect_cdf))
+}
+
+cdfTrace <- function(x , sample , burnin=0 , thin=1)
+    #' Traces the evolution of the gmcdf at point x through the MCMC iterations.
+    #'  Can be used for convergence monitoring. 
+    #' x: a single point (vector of size d)
+    #' burnin, thin: see MHpredictive
+    #' returns: a vector of length [ (nsample - burnin )/thin ]
+{
+    nsample <- ncol(sample$p)
+    inds <- (burnin+1):nsample
+    inds <- inds[inds%%thin==0]
+    output <- vapply(inds , function(niter){
+      ## complete the code using gmcdf
+      gmcdf(x , sample$Mu[,,niter], sample$Sigma[,,,niter], sample$p[,niter])},
+      FUN.VALUE = numeric(1))
+    return(output)
+}
+```
+To obtain such a time series, we complete the function $\texttt{cdfTrace}$ as follows :
+
+```{r, eval=FALSE, echo=TRUE}
+gmcdf(x, sample$Mu[,,niter], sample$Sigma[,,,niter], sample$p[,niter])
+```
+We notice that parameters $\texttt{thin}$ and $\texttt{burnin}$ allow respectively to keep only one out of $\texttt{thin}$ samples and to discard the first $\texttt{burnin}$ samples.
+
+## <font color='green'> Question 5 </font> 
+
+The Heidelberger and Welch's approach calculates a test statistic to accept or reject the null hypothesis that the Markov chain is from a stationary distribution. It consists in two parts :
+
+* It calculates the test statistic on the whole chain. If null hypothesis is rejected, it discards the first 10% of the chain and calculates the test statistic on the rest of the chain. It repeats this step until null hypothesis is accepted or 50% of the chain is discarded. The latter outcome constitutes "failure" of the stationary test and indicates that the chain needs to be run longer. If the stationarity test is passed, the number of iterations to keep and the number to discard are reported.
+
+* The half-width test calculates a 95% confidence interval for the mean, using the portion of the chain which passed the stationarity test. Half the width of this interval is compared with the estimate of the mean. If the ratio between the half-width and the mean is lower than $\epsilon$, the halfwidth test is passed. Otherwise the chain must be run out longer.
+
+All of this is done using the function $\texttt{heidel.diag}$ in $\texttt{R}$.
+
+If the half-width test fails, then the run should be extended, and we should increase the run length by a factor $I > 1.5$, each time, so that estimate has the same, reasonably large, proportion of new data.
+
+Therefore, an idea to use $\texttt{heidel.diag}$ and $\texttt{cdfTrace}$ to propose a reasonable number of iterations to achieve convergence is :
+
+* Starting with $N_\textrm{sample} = 3000$.
+
+* Selecting randomly a sample of the dataset $X_{1:N}$ of size $8$ and calculating the Heidelberger and Welch's diagnostic for each of the $8$ samples. 
+
+  * If both tests pass for every samples, then we devide the number of MCMC iterations by $1.5$ and we repeat the same step.
+  
+  * If one of the tests of one of the samples fails, then we choose the previous number of MCMC iterations.
+
+With this method, we will find a reasonable number of iterations to achieve convergence. However, due to the samples being selected randomly, we repeat the algorithm $3$ times and we select the median result as the number of MCMC iterations.
+
+The code is the following :
+
+```{r, echo=TRUE}
+set.seed(seed)
+init <- initPar(x=X, k=Kmc)
+set.seed(1)
+nb_iterations_ <- c()
+for (it in 1:3){
+    samples <- sample(1:N,8)
+    nsample <- 3000
+    nsample_prev <- nsample
+    outputmh <- MHsample(x=X, k=Kmc, nsample=nsample, init=init, hpar=hpar, ppar=ppar)
+    pass <- TRUE
+    while (pass) {
+        for(n in samples){
+            res <- heidel.diag(mcmc(cdfTrace(X[n,],outputmh)))
+            if(res[1]!= 1 | res[4]!=1){
+                pass <- FALSE
+                break
+            }
+        }
+        nsample_prev <- nsample
+        nsample <- round(nsample*2/3)
+        outputmh <- MHsample(x=X, k=Kmc, nsample=nsample, init=init, hpar=hpar, ppar=ppar)
+    }
+    nb_iterations_ <- c(nb_iterations_, nsample_prev)
+}
+nb_iterations <- median(nb_iterations_)
+nb_iterations
+```
+We find $1333$ as a reasonable number of iterations to achieve convergence.
+
+## <font color='green'> Question 6 </font> 
+
+We generate three different chains with different starting values. First, let's look at the plot of each chain :
+```{r}
+nsample <- 3000
+
+set.seed(seed + 1)
+init1<- initPar(x=X, k=Kmc)
+set.seed(seed + 2)
+init2<- initPar(x=X, k=Kmc)
+set.seed(seed + 3)
+init3<- initPar(x=X, k=Kmc)
+
+set.seed(1)
+outputmh1 <- MHsample(x=X, k=Kmc, nsample= nsample, init=init1, hpar=hpar, ppar=ppar)
+outputmh2 <- MHsample(x=X, k=Kmc, nsample= nsample, init=init2, hpar=hpar, ppar=ppar)
+outputmh3 <- MHsample(x=X, k=Kmc, nsample= nsample, init=init3, hpar=hpar, ppar=ppar)
+```
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+n <- sample(1:N,1)
+outputmh1_x <- mcmc(cdfTrace(X[n,], outputmh1))
+outputmh2_x <- mcmc(cdfTrace(X[n,], outputmh2))
+outputmh3_x <- mcmc(cdfTrace(X[n,], outputmh3))
+plot(outputmh1_x, main="Chain outputmh1")
+```
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+plot(outputmh2_x, main="Chain outputmh2")
+```
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+plot(outputmh3_x, main="Chain outputmh3")
+```
+
+There are two plots for each $\textit{cdf}$. The left plot shows the values the $\textit{cdf}$ took during the runtime of the chain. The right plot is the marginal density plot. It is the smoothened histogram of the values in the $\texttt{cdfTrace}$ plot, more precisely, the distribution of the values of the $\textit{cdf}$ in the chain.
+
+We clearly see the acceptancy/rejection pattern, with the several constant portions of the curves.
+
+The Gelman and Rubin's diagnostic measures whether there is a significant difference between the variance within several chains and the variance between several chains by a value that is called "scale reduction factor". We can first look at a combination of the three chains :
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+outputmh_list <- mcmc.list(outputmh1_x, outputmh2_x, outputmh3_x)
+plot(outputmh_list)
+```
+We can use $\texttt{gelman.diag}$ to obtain the scale reduction factor for the $\textit{cdf}$. A factor of $1$ means that between variance and within chain variance are equal, larger values mean that there is still a notable difference between chains. We can set a tolerance threshold to $1.1$ and look at the number of iterations that we get.
+
+```{r, echo=TRUE}
+gelman.diag(outputmh_list)
+```
+First, we observe that at the end of our $3000$ iterations, the scale reduction factor is below $1.1$.
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+gelman.plot(outputmh_list)
+lines(1:3000, rep(1.1,3000), main="Gelman and Rubin's diagnostic", col="magenta", lty=2)
+legend("topright", legend=c('Threshold : 1.1'), lty=2, col='magenta', cex=0.8)
+```
+
+We can see on the plot from the Gelman and Rubin's diagnostic, that a reasonable number of iterations for the chain to converge would be around $1400$, which is a value close to the one we found with the Heidelberger and Welch's test.
+
+## <font color='green'> Question 7 </font> 
+The predictive density can be estimated from the Metropolis-Hastings sample by computing the empirical mean of the density over the Metropolis-Hastings output :
+$$
+\hat{f}_{\textrm{MH}}(y) = \frac{1}{M} \sum_{t=1}^Mf(y|\rho_{1:k}^t, \mu_{1:k}^t,\Sigma_{1:k}^t)
+$$
+where $M$ is the number of remaining samples after discarding the burn-in period and thinning.
+
+We complete the code in order to plot the numerical approximation together with the true density. We define $\texttt{outputmh}$ as one of the three previously generated chains with good p-values for the Heidelberger and Welch's test and we set $\texttt{burnin} = 1333$ : 
+```{r}
+MHpredictive <- function(x , sample , burnin=0, thin=1)
+    #' posterior predictive density computed from MH output. 
+    #' x: vector size d (single point)
+    #' sample: output from the MCMC algorithm should contain
+    #'    entries Mu, Sigma, p as in MHsample's output
+    #' burnin: length of the burn-in period
+    #'   (number of sample being discarded at the beginning of the chain).
+    #' thin: thinning parameter: only 1 sample out of 'thin' will be kept
+    #' returns: a single numeric value
+{
+    nsample <- ncol(sample$p)
+    inds <- (burnin+1):nsample
+    inds <- inds[inds%%thin==0]
+    k <- nrow(sample$p)
+    vectllk <- vapply(inds, function(niter){
+      ## complete the code
+      vect_denisty_niter <- vapply(1:k, function(j){
+        dmnorm(x, mean = sample$Mu[j,,niter], varcov = sample$Sigma[,,j,niter])
+      }, FUN.VALUE = numeric(1))
+      sum(sample$p[,niter]*vect_denisty_niter)
+    }, FUN.VALUE = numeric(1))
+    return(mean(vectllk))
+}
+```
+
+```{r}
+wrapper <- function(x , y , FUN, ...)
+    #' applies a function on a grid with abscissas x, y.
+    #' x, y: vectors of same length.
+    {
+       sapply(seq_along(x), FUN = function(i){FUN(x[i], y[i],...)})
+}
+```
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+burnin <- 1333
+thin <- 1
+res <- rep(0,3)
+res[1] <- heidel.diag(outputmh1_x)[3]
+res[2] <- heidel.diag(outputmh2_x)[3]
+res[3] <- heidel.diag(outputmh3_x)[3]
+
+if (res[1] == max(res[1], res[2], res[3])){
+    outputmh <- outputmh1
+}else if(res[2] == max(res[2], res[3])){
+    outputmh <- outputmh2
+}else{
+    outputmh <- outputmh3
+}
+
+xx <- seq(-2,2,length.out=20)
+yy <- xx
+dtrue <- outer(X= xx, Y=yy,
+               FUN = function(x,y){
+                   wrapper(x=x, y=y,
+                           FUN=function(u,v){
+                               exp(gmllk(x=c(u,v), Mu=Mu,
+                                         Sigma=Sigma, p=p)) }) })
+dpredmh <-  outer(X= xx, Y=yy,
+                  FUN = function(x,y){
+                      wrapper(x = x, y = y,
+                              FUN =function(u,v){
+                                  ## complete the code 
+                                  MHpredictive(x=c(u,v), outputmh, 
+                                               burnin=burnin, thin=thin) }) })
+breaks <- c(seq(0.01,0.09, length.out=5),seq(0.1,0.3,length.out=5))
+nbreaks <- length(breaks)
+
+contour(xx,yy, z=dtrue, nlevels=nbreaks, levels=breaks, 
+        main='Metropolis-Hastings', xlab=TeX('$X_1$'), ylab=TeX('$X_2$'))
+contour(xx,yy, z=dpredmh,  nlevels=nbreaks, levels=breaks,
+        add=TRUE, col='red')
+
+set.seed(seed)
+init <- initPar(x=X, k=Kmc)
+
+points(X[,1], X[,2], col=xi, pch=21)
+legend("bottomleft", legend = c('True component 1','True component 2','True component 3', 
+                                'True density', 'Predictive density'),  
+           pch=c(21,21,21,NA,NA), col=c(1,2,3,1,2), 
+           lty=c(NA,NA,NA,1,1), ncol=2, cex=0.8)
+```
+The numerical approximation is close to the true density. Compared to the Variational Bayes which estimated Gaussian distribution support is limited by the true distribution, we can see in the figure that we are not limited with Metropolis-Hastings.
+
+# <font color='color'>  Predictive distributions versus maximum likelihood distribution </font> 
+
+In this section we focus on the probability of an excess of a threshold $u \in \mathbb{R}$.
+
+$$
+\phi(u, \rho_{1:k}, \mu_{1:k}, \Sigma_{1:k}) = 1 - F(u|\rho_{1:k}, \mu_{1:k}, \Sigma_{1:k}) = \mathbb{P}(X_1>u \textrm{ or ... or } X_d>u|\rho_{1:k}, \mu_{1:k}, \Sigma_{1:k}) 
+$$
+where $F(y|\rho_{1:k}, \mu_{1:k}, \Sigma_{1:k})$ is the $\textit{cdf}$ for the Gaussian Mixture ($\texttt{gmcdf}$ function).
+
+The objective is to compare the performance of the estimators obtained by Variational Bayes and Metropolis-Hastings. 
+
+* The true $\phi$ is easily computed using $\texttt{gmcdf}$.
+
+* $\hat{\phi}_2(u) = \mathbb{E}\big[ \phi (u, \rho_{1:k}, \mu_{1:k}, \Sigma_{1:k})\big]\ with \ (\rho_{1:k}, \mu_{1:k}, \Sigma_{1:k}) \sim Q^{*}$ where $Q^{*}$ is the posterior variational distribution. $\hat{\phi}_2$ is computed using the function $\texttt{vbPredictiveCdf}$.
+
+* $\hat{\phi}_3(u) = \frac{1}{M}\sum_{t=1}^M \phi (u, \rho^t_{1:k}, \mu^t_{1:k}, \Sigma^t_{1:k})$ where $M$ is the number of remaining samples after discarding the burn-in period and thinning. $\hat{\phi}_3$ is computed using the function $\texttt{MHpredictiveCdf}$.
+
+
+## <font color='green'> Question 1 </font> 
+
+First, we complete the function $\texttt{MHpredictiveCdf}$.
+
+```{r}
+vbPredictiveCdf <- function(x, Alpha, Beta, M, Winv, Nu)
+    #' predictive cumulative distribution function based on the VB approximation.
+    #' x: a single point (vector): where to evaluate the cdf. 
+    #' Alpha, Winv, Nu, M, Beta: the VB posterior parameters,  see vbEstep
+    #' returns the value of the variational posterior predictive cdf
+    #'  (= mean of the mixture cdf under the variational posterior predictive)
+    #'   at point x. 
+{
+    k <- length(Alpha)
+    d <-  length(x)
+    vectcdf <- vapply(X= 1:k, FUN= function(j){
+        W <- Winv[,,j]
+        L <-  (1 + Beta[j])/ ((Nu[j] + 1 - d) * Beta[j])  *   W
+        L <- 1/2 * (L + t(L)) ## ensures symmetry despite numerical errors
+        return(pmt(x=x, mean = M[j,], S = L, df = round(Nu[j] + 1 - d), log=FALSE))},
+        FUN.VALUE= numeric(1) )
+
+    return(sum(Alpha * vectcdf) / sum(Alpha))
+}
+
+MHpredictiveCdf <- function(x , sample , burnin = 0, thin = 1)
+    #' posterior predictive cdf computed from MH output.
+    #' arguments: see MHpredictive.
+    #' returns: a single numeric value. 
+{
+    nsample <- ncol(sample$p)
+    inds <- (burnin+1):nsample
+    inds <- inds[inds%%thin==0]
+    k <- nrow(sample$p)
+    vectcdf <- vapply(inds, function(niter){
+      ## complete the code
+      vect_cdf_niter <- vapply(1:k, function(j){
+        pmnorm(x, mean = sample$Mu[j,,niter], varcov = sample$Sigma[,,j,niter])
+      }, FUN.VALUE = numeric(1))
+      sum(sample$p[,niter]*vect_cdf_niter)
+  }, FUN.VALUE = numeric(1)
+  )
+    
+    gmcdf <- function(x , Mu , Sigma , p)
+    #' multivariate cumulative distribution function in a GMM. 
+    #' x: a single point (vector of size d)
+    #' Mu, Sigma, p: see gmllk.
+    #' returns: the cdf at point x. 
+{
+    k <- length(p)
+    vect_cdf <- vapply(1:k, function(j){
+        pmnorm(x, mean = Mu[j,], varcov = Sigma[,,j])
+    }, FUN.VALUE = numeric(1))
+    return(sum(p*vect_cdf))
+}
+      return(list(mean=mean(vectcdf), q05=quantile(vectcdf,0.05), q95=quantile(vectcdf,0.95)))
+}
+```
+
+## <font color='green'> Question 2 </font> 
+
+We consider a range of thresholds on the diagonal line, $u = (x, x), \forall x \in [−1, 4]$. Let's complete the following code chunk in order to plot on the same graph, as a function of $x$,
+$$
+\begin{aligned}
+&\phi((x,x)|\rho_{1:k}, \mu_{1:k}, \Sigma_{1:k})\\
+&\hat{\phi}_2(x,x)\\
+&\hat{\phi}_3(x,x)
+\end{aligned}
+$$
+
+We set $\texttt{burnin} = 1333$ : 
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+Pexcess <- rep(0,10)
+Pexcess_vb <- Pexcess; Pexcess_mh <- Pexcess
+thres_vect <-  seq(-1, 4, length.out=30)
+for(i in seq_along(thres_vect)){
+    threshold <- rep(thres_vect[i], 2)
+    Pexcess[i] <- 1 - gmcdf(x=threshold, Mu=Mu, Sigma=Sigma, p=p)
+    ## complete the code:
+    ## posterior predictive  estimator using VB output: 
+    ## use vbPredictiveCdf
+    Pexcess_vb[i] <- 1 - vbPredictiveCdf(
+        x=threshold, Alpha=outputvb$Alphamat[,T], Beta=outputvb$Betamat[,T], 
+        M=outputvb$Marray[,,T], Winv=outputvb$Winvarray[,,,T], Nu=outputvb$Numat[,T]
+    )
+    ## complete the code:
+    ## posterior predictive  estimator using MH output:
+    ## use MHpredictiveCdf. 
+    Pexcess_mh[i] <-  1 - MHpredictiveCdf(x=threshold ,sample=outputmh, burnin=burnin, thin=thin)$mean
+}
+ylim <- range(Pexcess, Pexcess_vb, Pexcess_mh)
+plot(thres_vect,Pexcess, ylim=ylim)
+lines(thres_vect, Pexcess_vb, col='red')
+lines(thres_vect, Pexcess_mh, col='green')
+legend("topright", legend=c(TeX('$\\phi'), TeX('$\\hat{\\phi}_2'), TeX('$\\hat{\\phi}_3')), 
+       col=1:3, lty=c(1,1,1), cex=1, ncol=3)
+```
+
+The probability of an excess of a threshold $u \in \mathbb{R}$ for the Metropolis-Hastings model fits perfectly the curve for the true Gaussian mixture distribution. The one for the Variational Bayes model is slightly different for some thresholds. 
+
+## <font color='green'> Question 3 </font> 
+
+Now, we consider the tail of the distribution : we consider a range of thresholds on the diagonal line, $u = (x, x), \forall x \in [1, 5]$ :
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+Pexcess <- rep(0,10)
+Pexcess_vb <- Pexcess; Pexcess_mh <- Pexcess
+thres_vect <-  seq(1, 5, length.out=30) 
+for(i in seq_along(thres_vect)){
+    threshold <- rep(thres_vect[i], 2)
+    Pexcess[i] <- 1 - gmcdf(x=threshold, Mu=Mu, Sigma=Sigma, p=p)
+    ## complete the code:
+    ## posterior predictive  estimator using VB output: 
+    ## use vbPredictiveCdf
+    Pexcess_vb[i] <- 1 - vbPredictiveCdf(
+        x=threshold, Alpha=outputvb$Alphamat[,T], Beta=outputvb$Betamat[,T], 
+        M=outputvb$Marray[,,T], Winv=outputvb$Winvarray[,,,T], Nu=outputvb$Numat[,T]
+    )
+    ## complete the code:
+    ## posterior predictive  estimator using MH output:
+    ## use MHpredictiveCdf. 
+    Pexcess_mh[i] <-  1 - MHpredictiveCdf(x=threshold ,sample=outputmh, burnin=burnin, thin=thin)$mean
+}
+ylim <- range(Pexcess, Pexcess_vb, Pexcess_mh)
+plot(thres_vect,Pexcess, ylim=ylim)
+lines(thres_vect, Pexcess_vb, col='red')
+lines(thres_vect, Pexcess_mh, col='green')
+legend("topright", legend=c(TeX('$\\phi'), TeX('$\\hat{\\phi}_2'), TeX('$\\hat{\\phi}_3')), 
+       col=1:3, lty=c(1,1,1), cex=1, ncol=3)
+```
+
+For the tail of the mixture distributions, the results are similar, but $\hat{\phi}_2$ seems to have lower probabilities for small values of $u$.
+
+## <font color='green'> Question 4 </font> 
+
+We now focus on $\hat{\phi}_3$. Let's plot on the same graph the posterior 90% credible sets obtained with the empirical quantiles of the time series $\phi((x,x)|\rho_{1:k}^t, \mu_{1:k}^t, \Sigma_{1:k}^t)$, $t \in \{1,...,M\}$ :
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+Pexcess <- rep(0,10)
+Pexcess_mh <- Pexcess ; q05_mh <- Pexcess ; q95_mh <- Pexcess
+thres_vect <-  seq(-1, 4, length.out=30)
+for(i in seq_along(thres_vect)){
+    threshold <- rep(thres_vect[i], 2)
+    Pexcess[i] <- 1 - gmcdf(x=threshold, Mu=Mu, Sigma=Sigma, p=p)
+    Pexcess_mh[i] <-  1 - MHpredictiveCdf(x=threshold ,sample=outputmh, burnin=burnin, thin=thin)$mean
+    q05_mh[i] <-  1 - MHpredictiveCdf(x=threshold ,sample=outputmh, burnin=burnin, thin=thin)$q05
+    q95_mh[i] <-  1 - MHpredictiveCdf(x=threshold ,sample=outputmh, burnin=burnin, thin=thin)$q95
+}
+ylim <- range(Pexcess, Pexcess_vb, Pexcess_mh)
+plot(thres_vect,Pexcess, ylim=ylim)
+lines(thres_vect, Pexcess_mh, col='green')
+lines(thres_vect, q05_mh, col='blue')
+lines(thres_vect, q95_mh, col='blue')
+legend("topright", legend=c(TeX('$\\phi'), TeX('$\\hat{\\phi}_3'), 
+                            '90% quantiles'), 
+       col=c(1,3,4), lty=c(1,1,1), cex=1, ncol=1)
+```
+
+
+```{r, fig.width = 15, fig.height = 8, fig.align='center'}
+Pexcess <- rep(0,10)
+Pexcess_mh <- Pexcess ; q05_mh <- Pexcess ; q95_mh <- Pexcess
+thres_vect <-  seq(1, 5, length.out=30) 
+for(i in seq_along(thres_vect)){
+    threshold <- rep(thres_vect[i], 2)
+    Pexcess[i] <- 1 - gmcdf(x=threshold, Mu=Mu, Sigma=Sigma, p=p)
+    Pexcess_mh[i] <-  1 - MHpredictiveCdf(x=threshold ,sample=outputmh, burnin=burnin, thin=thin)$mean
+    q05_mh[i] <-  1 - MHpredictiveCdf(x=threshold ,sample=outputmh, burnin=burnin, thin=thin)$q05
+    q95_mh[i] <-  1 - MHpredictiveCdf(x=threshold ,sample=outputmh, burnin=burnin, thin=thin)$q95
+}
+ylim <- range(Pexcess, Pexcess_vb, Pexcess_mh)
+plot(thres_vect,Pexcess, ylim=ylim)
+lines(thres_vect, Pexcess_mh, col='green')
+lines(thres_vect, q05_mh, col='blue')
+lines(thres_vect, q95_mh, col='blue')
+legend("topright", legend=c(TeX('$\\phi'), TeX('$\\hat{\\phi}_3'), 
+                             '90% quantiles'), 
+       col=c(1,3,4), lty=c(1,1,1), cex=1, ncol=1)
+```
+
+The 90% credible sets are pretty thin around the probability of an excess.
